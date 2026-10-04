@@ -50,6 +50,20 @@ Series USB oscilloscopes already exist, and what can be borrowed?
   rapid-block, streaming and signal-generator call sequences. They are
   illustrations only; the guide decides.
 
+## Official next-generation wrapper: `pypicosdk` (checked 2026-10-04)
+
+- https://github.com/picotech/pyPicoSDK, PyPI `pypicosdk` 1.7.5 (2026-08),
+  ISC licence, Python >=3.10, maintained by Pico Technology. Object-oriented
+  API (`scope = psdk.ps6000a(); scope.open_unit()`), still needs PicoSDK
+  installed separately.
+- **Supports only the 6000E (`ps6000a`), 3000E and 5000E (`psospa`) and
+  5000D (`ps5000a`) series.** The package tree has no `ps2000` or `ps2000a`
+  module and the README lists no 2000 Series model. It cannot drive a
+  PicoScope 2000 and is not a candidate dependency.
+- Worth reading for the shape of a Pythonic layer over the C API (unit
+  open/close, channel setup, block capture, streaming, error list), since it
+  is Pico's own view of how the ctypes calls should be wrapped.
+
 ## Unofficial wrapper: `pico-python`
 
 - https://github.com/colinoflynn/pico-python, PyPI `picoscope` 0.7.32
