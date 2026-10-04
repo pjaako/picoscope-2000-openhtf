@@ -74,28 +74,76 @@ Series USB oscilloscopes already exist, and what can be borrowed?
   as a dependency: it hides the C API we need to cite, and its tables are not
   the manual.
 
-## Reference concept (the owner's own plugs)
+## Reference concept: rigol-dho-openhtf (the owner's own scope plug)
+
+https://github.com/pjaako/rigol-dho-openhtf (MIT, Python >=3.12) is the
+concept this plug follows, because both are oscilloscope plugs. What carries
+over, in words (the Pico driver has no SCPI, so nothing transfers literally):
+
+- **Data-centred API.** The package exports one plug class and one
+  `Waveform` type. `Waveform` is a NamedTuple of float64 numpy arrays in SI
+  units (`t`, `v`), the untouched `raw` ADC samples, and the metadata needed
+  to recompute `t` and `v` from `raw`. `t = 0` is the trigger point. Stored
+  data is raw plus metadata, never float arrays.
+- **Capture conditions are typed data**, not setters: frozen keyword-only
+  dataclasses (`Capture`, `Channel`, `Edge`) with `Literal` choices validated
+  in `__post_init__`, one source of truth for the allowed values, every
+  problem reported in one pass. A YAML front end with a generated JSON Schema
+  exists; it is optional for a first version.
+- **Capture flow is explicit primitives**: apply the capture conditions
+  (validate everything first, send nothing on error, read back, raise once
+  listing every mismatch), arm a single acquisition, poll until stopped with
+  a timeout (`TimeoutError`), read the waveform. The PicoScope equivalent is
+  arm a block, poll ready, fetch buffers, convert ADC counts to volts.
+- **Measurements are Python functions** on the waveform (Vpp, frequency with
+  percentile levels and hysteresis), validated against an independent oracle
+  on hardware. The scope's own measurement engine was only ever an oracle;
+  the PicoScope has none, so the Python path is the only one.
+- **The fake generates deterministic waveforms** (a bounded 1 kHz clock, or
+  counter patterns), uses non-zero offsets so a missing conversion term fails
+  a test, injects named defects (`shift`, `gain`, `glitch`), models the
+  arm/wait/stop state machine, and copies measured hardware quirks in with
+  dated comments, made harsher than the real instrument.
+- **Clipped data is refused** where a verdict depends on it (raw at 0 or the
+  top code).
+- **Golden-waveform comparison** (`golden.py`, mask-based verdict) is an
+  optional later phase.
+- **tearDown** restores saved state, stops, closes only handles the plug
+  opened, never shared ones. For a scope nothing is dangerous; stop and
+  close is enough.
+- **README is the measurement log**: "Facts this is built on", "Things the
+  manual does not tell you (firmware ...)" with observation, conditions,
+  date, consequence, and explicit "not yet understood" subsections.
+- **AGENTS.md** is a flat bullet list; later `SPEC-*.md` files are full work
+  orders that start with "The real oscilloscope is NOT available to you",
+  then "Facts measured", per-file rules, and "Done means".
+
+Not carried over from rigol-dho (the siglent siblings do these better):
+unguarded, non-idempotent tearDown and constructor; no transport Protocol;
+SCPI literals without manual citations; no CI, no ruff, partial mypy; no
+status file in git; no probe tool; no hardware-transcript oracle. The full
+comparison is in the owner's session notes (RIGOL_DHO_REFERENCE.md, not
+committed).
+
+## Process conventions: the siglent siblings
 
 - https://github.com/pjaako/siglent-sdg-openhtf (complete, hardware-verified):
   `src/` layout, hatchling, `uv`, Python 3.13, thin `BasePlug` with an
-  injectable transport, hand-written fake that logs calls and models state,
-  pytest against the fake only, `example_test.py --fake`, `tools/probe.py`,
-  `tests/data/hardware_session_1.txt` replay oracle, mypy strict, CI on
-  ubuntu.
+  injectable transport Protocol, guarded idempotent `tearDown`, constructor
+  cleanup on failure, pytest against the fake only, `example_test.py --fake`,
+  `tools/probe.py`, `tests/data/hardware_session_1.txt` replay oracle, mypy
+  strict, CI on ubuntu.
 - https://github.com/pjaako/siglent-spd-openhtf (newer process documents):
   `AGENTS.md`, `SPEC.md` with a "Done means" checklist, committed
   `HANDOFF.md`, `docs/<protocol>_reference.md` transcribed from the manual
   with an "Open questions for hardware verification" section,
   `# ASSUMPTION(hw):` markers, ruff + mypy.
-- https://github.com/pjaako/rigol-dho-openhtf: the original scope plug both
-  siblings name as the file-naming reference. Not cloned yet; it is the
-  closest instrument class (an oscilloscope) and should be read before
-  `SPEC.md` is written.
 
-This project follows the spd conventions where they are newer and the sdg
-code where spd has none yet. The transport seam becomes a *driver* protocol
-(ctypes function table) instead of a VISA resource, and the fake becomes a
-fake driver that models handle, channels, timebase, trigger and buffers.
+This project takes the API concept from rigol-dho and the process and
+robustness conventions from the siglent siblings. The transport seam becomes
+a *driver* protocol (ctypes function table) instead of a VISA resource, and
+the fake becomes a fake driver that models handle, channels, timebase,
+trigger, buffers and generates waveforms.
 
 ## Projects worth borrowing structure from (structure only, no API details)
 
