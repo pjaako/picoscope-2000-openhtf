@@ -118,6 +118,35 @@ def test_probe_writes_report_with_every_item(tmp_path: Path) -> None:
     assert fake.units == {}  # the unit was closed
 
 
+def test_probe_item_4_reports_memory_segments_next_to_max_samples(tmp_path: Path) -> None:
+    fake = FakePs2000a(memory_samples=65536)
+    _, text, _, _ = _run_probe(tmp_path, fake)
+    assert text.count("-> ps2000aMemorySegments(1, 1)\n<- PICO_OK, 65536") == 2  # per config
+    assert (
+        "ps2000aMemorySegments(1): PICO_OK, nMaxSamples 65536 (total over all channels, PG §3.29) "
+        "next to maxSamples [65536] above" in text
+    )  # one channel: all the memory
+    assert "next to maxSamples [32768] above" in text  # two channels: half of it
+    assert "open question 31" in text
+    assert fake.units == {}
+
+
+@pytest.mark.parametrize(("bits", "expected"), [(16, "no"), (8, "yes")])
+def test_probe_item_6_reports_raw_modulo_256_statistics(
+    tmp_path: Path, bits: int, expected: str
+) -> None:
+    fake = FakePs2000a(adc_bits=bits)
+    _, text, _, _ = _run_probe(tmp_path, fake)
+    item_6 = text.split("## 6. ")[1].split("## 7. ")[0]
+    item_7 = text.split("## 7. ")[1].split("## 8. ")[0]
+    assert item_6.count("raw % 256:") == 2  # one line per channel
+    assert f"all multiples of 256: {expected}" in item_6
+    assert "raw % 256:" not in item_7
+    if bits == 16:
+        assert "of 2000 samples are multiples of 256" in item_6
+        assert "2 distinct residues" in item_6  # the clock: 0 and 16256 (16256 % 256 = 128)
+
+
 def test_probe_serial_flag_and_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakePs2000a(serials=("FAKE0/001", "FAKE0/002"))
     code, text, _, _ = _run_probe(tmp_path / "flag", fake, "--serial", "FAKE0/002")
@@ -140,7 +169,7 @@ def test_probe_failing_item_does_not_stop_the_run(tmp_path: Path) -> None:
     assert "PICO_INVALID_TIMEBASE" in text
     for title in ITEM_TITLES:
         assert title in text
-    assert "item failed: CaptureError" in text  # items 6 and 7: no timebase found
+    assert "item failed: PicoError" in text  # items 6 and 7: the timebase probe is refused
     assert "-> ps2000aCloseUnit(1)" in text
     assert fake.units == {}
 

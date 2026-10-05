@@ -168,10 +168,15 @@ def test_edge_auto_ms_bounds_inclusive() -> None:
     assert Edge(source=1, level=0.0, auto_ms=32767).auto_ms == 32767
 
 
-@pytest.mark.parametrize("delay", [-1, 0.5, "1", True])
-def test_edge_rejects_bad_delay(delay: Any) -> None:
-    with pytest.raises(ValueError, match="delay_samples must be"):
+@pytest.mark.parametrize("delay", [-1, 1, 5, 0.5, "1", True])
+def test_edge_rejects_a_non_zero_or_bad_delay(delay: Any) -> None:
+    # phase 1: a delay moves the trigger instant off index pre_samples (open question 30)
+    with pytest.raises(ValueError, match=r"delay_samples must be 0 .*open question 30"):
         Edge(source=1, level=0.0, delay_samples=delay)
+
+
+def test_edge_accepts_a_zero_delay() -> None:
+    assert Edge(source=1, level=0.0, delay_samples=0).delay_samples == 0
 
 
 def test_edge_reports_all_problems() -> None:

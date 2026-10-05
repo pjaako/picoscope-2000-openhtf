@@ -23,6 +23,7 @@ MAX_ADC = 32512
 class Meta(NamedTuple):
     overflow: bool
     max_adc: int
+    range_v: float
 
 
 class Wave(NamedTuple):
@@ -39,7 +40,7 @@ def make(
     raw = np.clip(np.round(v / range_v * MAX_ADC), -MAX_ADC, MAX_ADC).astype(np.int16)
     vq = raw.astype(np.float64) * (range_v / MAX_ADC)
     t = np.arange(len(raw), dtype=np.float64) * dt
-    return Wave(t=t, v=vq, raw=raw, meta=Meta(overflow=overflow, max_adc=MAX_ADC))
+    return Wave(t=t, v=vq, raw=raw, meta=Meta(overflow=overflow, max_adc=MAX_ADC, range_v=range_v))
 
 
 def sine(
@@ -167,6 +168,32 @@ def test_frequency_not_periodic_ramp() -> None:
         frequency_hz(make(np.linspace(-1.0, 1.0, 2000), 1e-6))
 
 
+def test_frequency_not_periodic_for_dc_with_adc_noise() -> None:
+    # a disconnected probe: +-1 code of noise around zero used to give a 170 kHz "frequency"
+    rng = np.random.default_rng(1)
+    codes = rng.integers(-1, 2, size=5000)
+    w = make(codes * 2.0 / MAX_ADC, 1e-6)
+    assert int(w.raw.max()) == 1 and int(w.raw.min()) == -1
+    with pytest.raises(ValueError, match="not periodic"):
+        frequency_hz(w)
+    with pytest.raises(ValueError, match="not periodic"):
+        period_s(w)
+    assert frequency_hz(w, min_vpp=0.0) > 1e4  # the old behaviour, on request
+
+
+def test_frequency_min_vpp_default_is_four_codes_of_the_range() -> None:
+    lsb = 2.0 / MAX_ADC
+    wave = square(1000.0, 1e-6, 5000, high=1.0)
+    assert frequency_hz(make(wave * 8 * lsb, 1e-6)) == pytest.approx(1000.0, rel=1e-3)  # 8 codes
+    with pytest.raises(ValueError, match="not periodic"):
+        frequency_hz(make(wave * 3 * lsb, 1e-6))  # 3 codes: below the default of 4
+    big = make(wave, 1e-6)  # 1 V
+    with pytest.raises(ValueError, match="not periodic"):
+        frequency_hz(big, min_vpp=1.5)  # explicit threshold above the amplitude
+    assert frequency_hz(big, min_vpp=0.5) == pytest.approx(1000.0, rel=1e-3)
+    assert 4 * big.meta.range_v / big.meta.max_adc == pytest.approx(4 * lsb)
+
+
 def test_frequency_two_crossings_is_enough() -> None:
     v = square(1000.0, 1e-6, 2500, high=1.0)  # rising edges at 0 is high; 1 ms, 2 ms
     w = make(v, 1e-6)
@@ -208,7 +235,7 @@ def test_is_clipped_false_just_below_full_scale() -> None:
         t=np.arange(3, dtype=np.float64),
         v=raw.astype(np.float64),
         raw=raw,
-        meta=Meta(overflow=False, max_adc=MAX_ADC),
+        meta=Meta(overflow=False, max_adc=MAX_ADC, range_v=1.0),
     )
     assert is_clipped(w) is False
 
@@ -220,7 +247,7 @@ def test_is_clipped_at_exactly_full_scale() -> None:
             t=np.arange(3, dtype=np.float64),
             v=raw.astype(np.float64),
             raw=raw,
-            meta=Meta(overflow=False, max_adc=MAX_ADC),
+            meta=Meta(overflow=False, max_adc=MAX_ADC, range_v=1.0),
         )
         assert is_clipped(w) is True
 

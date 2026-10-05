@@ -38,7 +38,7 @@ method raises `RuntimeError("plug closed")`.
 |---|---|
 | `apply_capture(capture)` | `SetChannel` for A..D, timebase search, `SetSimpleTrigger`, `SetDataBuffer`; raises `PicoError` on a bad status, `CaptureError` if the samples do not fit the memory |
 | `single()` | `RunBlock` with the conditions of the last `apply_capture` |
-| `wait_ready(timeout_s=None, poll_s=0.01)` | polls `IsReady`; on expiry stops the capture and raises `TimeoutError("no trigger within X s")` |
+| `wait_ready(timeout_s=None, poll_s=0.01)` | polls `IsReady`; on expiry stops the capture and raises `TimeoutError("capture not ready within X s")` |
 | `read_waveform(ch)` | `Waveform(t, v, raw, meta)` of channel 1..4; one `GetValues` serves all channels |
 | `stop()`, `ping()`, `flash_led(count=5)` | `Stop`, `PingUnit`, `FlashLed` (identify one of several scopes) |
 | `PicoScope2000Plug.list_units()` | serials of the unopened units |

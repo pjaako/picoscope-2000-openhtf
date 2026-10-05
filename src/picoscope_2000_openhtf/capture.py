@@ -101,7 +101,11 @@ class Channel:
 
 @dataclass(frozen=True, kw_only=True)
 class Edge:
-    """Edge trigger on one channel. `level` is in volts, `delay_samples` in sample periods."""
+    """Edge trigger on one channel. `level` is in volts.
+
+    `delay_samples` (sample periods, PG §3.56) must be 0 in phase 1: a delay moves the trigger
+    instant off index `pre_samples` (open question 30) and the time axis does not model that.
+    """
 
     source: int
     level: float
@@ -121,8 +125,13 @@ class Edge:
             )
         if not _is_int(self.auto_ms) or not 0 <= self.auto_ms <= MAX_AUTO_MS:
             problems.append(f"auto_ms must be an integer in 0..{MAX_AUTO_MS}, got {self.auto_ms!r}")
-        if not _is_int(self.delay_samples) or self.delay_samples < 0:
-            problems.append(f"delay_samples must be an integer >= 0, got {self.delay_samples!r}")
+        if not _is_int(self.delay_samples) or self.delay_samples != 0:
+            # PG §3.56 `delay` moves the trigger instant away from sample index pre_samples,
+            # which the time axis of a Waveform does not model (open question 30).
+            problems.append(
+                f"delay_samples must be 0 in phase 1 (a delay moves the trigger instant, "
+                f"open question 30), got {self.delay_samples!r}"
+            )
         _raise_if(problems, "Edge")
 
 

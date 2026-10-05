@@ -27,6 +27,9 @@ class WaveformMetaLike(Protocol):
     @property
     def max_adc(self) -> int: ...
 
+    @property
+    def range_v(self) -> float: ...
+
 
 class WaveformLike(Protocol):
     """Structural type of `Waveform`: volts, seconds, untouched ADC counts, metadata."""
@@ -93,7 +96,12 @@ def vrms(w: WaveformLike, *, allow_clipped: bool = False) -> float:
 
 
 def frequency_hz(
-    w: WaveformLike, *, low: float = 0.3, high: float = 0.7, allow_clipped: bool = False
+    w: WaveformLike,
+    *,
+    low: float = 0.3,
+    high: float = 0.7,
+    min_vpp: float | None = None,
+    allow_clipped: bool = False,
 ) -> float:
     """Frequency of a periodic signal from rising crossings, with hysteresis.
 
@@ -111,12 +119,19 @@ def frequency_hz(
     4. ``frequency = (n_crossings - 1) / (t_last_crossing - t_first_crossing)``.
 
     Fewer than two crossings (DC, a single edge, a flat trace) raise
-    ``ValueError("not periodic")``.
+    ``ValueError("not periodic")``. So does an amplitude ``hi - lo`` below ``min_vpp`` volts
+    (default: 4 ADC codes, ``4 * range_v / max_adc``): without it the percentile levels of a flat
+    trace with a code or two of ADC noise (a disconnected probe) would produce hundreds of
+    "crossings" and a plausible-looking frequency.
     """
     if not 0.0 <= low < high <= 1.0:
         raise ValueError(f"need 0 <= low < high <= 1, got low={low}, high={high}")
     v = _check(w, allow_clipped)
     lo, hi = np.percentile(v, [5.0, 95.0])
+    if min_vpp is None:
+        min_vpp = 4 * w.meta.range_v / w.meta.max_adc  # 4 ADC codes
+    if hi - lo < min_vpp:
+        raise ValueError("not periodic")
     low_level = lo + low * (hi - lo)
     high_level = lo + high * (hi - lo)
     below = v < low_level
@@ -138,7 +153,12 @@ def frequency_hz(
 
 
 def period_s(
-    w: WaveformLike, *, low: float = 0.3, high: float = 0.7, allow_clipped: bool = False
+    w: WaveformLike,
+    *,
+    low: float = 0.3,
+    high: float = 0.7,
+    min_vpp: float | None = None,
+    allow_clipped: bool = False,
 ) -> float:
     """Period in seconds, the inverse of `frequency_hz`."""
-    return 1.0 / frequency_hz(w, low=low, high=high, allow_clipped=allow_clipped)
+    return 1.0 / frequency_hz(w, low=low, high=high, min_vpp=min_vpp, allow_clipped=allow_clipped)

@@ -50,6 +50,7 @@ def _capture(
     channels: tuple[str, ...] = (A,),
     ranges: tuple[str, ...] = ("PS2000A_2V",),
     trigger: tuple[str, int, str] | None = None,
+    auto_ms: int = 0,
     poll: bool = True,
 ) -> dict[str, Int16Array]:
     """Configure, run and read one block; returns the buffers by channel name."""
@@ -59,7 +60,9 @@ def _capture(
         assert fake.ps2000aSetSimpleTrigger(handle, 0, A, 0, "PS2000A_RISING", 0, 0) == (OK,)
     else:
         source, threshold, direction = trigger
-        assert fake.ps2000aSetSimpleTrigger(handle, 1, source, threshold, direction, 0, 0) == (OK,)
+        assert fake.ps2000aSetSimpleTrigger(
+            handle, 1, source, threshold, direction, 0, auto_ms
+        ) == (OK,)
     buffers = {name: np.zeros(pre + post, dtype=np.int16) for name in channels}
     for name, buf in buffers.items():
         assert fake.ps2000aSetDataBuffer(handle, name, buf, 0, NONE) == (OK,)
@@ -509,7 +512,7 @@ def test_set_data_buffer_keeps_the_array_itself() -> None:
     handle = _open(fake)
     buf = np.zeros(100, dtype=np.int16)
     assert fake.ps2000aSetDataBuffer(handle, A, buf, 0, NONE) == (OK,)
-    assert fake.units[handle].buffers[A] is buf  # PG §3.40: tells the driver where to store
+    assert fake.units[handle].buffers[A]() is buf  # PG §3.40: tells the driver where to store
 
 
 def test_set_data_buffer_validation() -> None:
@@ -647,7 +650,7 @@ def test_get_values_without_any_run_is_no_samples_available() -> None:
 def test_get_values_returns_min_of_requested_and_total() -> None:
     fake = FakePs2000a()
     handle = _open(fake)
-    _capture(fake, handle)
+    _buffers = _capture(fake, handle)  # keep the arrays alive: the fake holds weak references
     assert _get(fake, handle, 5000)[1] == 2000
     assert _get(fake, handle, 2000)[1] == 2000
     assert _get(fake, handle, 1500)[1] == 1500
@@ -672,7 +675,7 @@ def test_get_values_start_index() -> None:
 def test_get_values_argument_validation() -> None:
     fake = FakePs2000a()
     handle = _open(fake)
-    _capture(fake, handle)
+    _buffers = _capture(fake, handle)  # keep the arrays alive
     g = fake.ps2000aGetValues
     assert g(handle, 0, 10, 1, NONE, 1)[0] == STATUS["PICO_SEGMENT_OUT_OF_RANGE"]
     assert g(handle, 0, 10, 1, "RATIO", 0)[0] == STATUS["PICO_INVALID_PARAMETER"]
@@ -859,15 +862,101 @@ def test_other_directions_have_a_defined_alignment() -> None:
         assert bool(buffers[A][100] > 0) is first_high, direction
 
 
-def test_trigger_that_never_fires_behaves_as_auto_trigger() -> None:
+def _never_ready(fake: FakePs2000a, handle: int, polls: int = 500) -> bool:
+    return all(fake.ps2000aIsReady(handle) == (OK, 0) for _ in range(polls))
+
+
+@pytest.mark.parametrize(
+    ("direction", "level_v"),
+    [
+        ("PS2000A_RISING", 1.5),  # above the 0..1 V clock
+        ("PS2000A_FALLING", 1.5),
+        ("PS2000A_RISING_OR_FALLING", 1.5),
+        ("PS2000A_ABOVE", 1.5),
+        ("PS2000A_RISING", -0.5),  # below it: the signal is never below the level
+        ("PS2000A_FALLING", 0.0),  # at the low level: no sample is below it
+        ("PS2000A_BELOW", -0.5),  # the signal is never below
+    ],
+)
+def test_unreachable_trigger_level_without_auto_trigger_never_becomes_ready(
+    direction: str, level_v: float
+) -> None:
     fake = FakePs2000a(clock_v=1.0)
     handle = _open(fake)
-    # 1.5 V on the 2 V range is above the 1 V clock: no crossing, phase 0 like no trigger
+    threshold = round(level_v / 2.0 * 32512)
+    buffers = _capture(fake, handle, trigger=(A, threshold, direction), poll=False)
+    assert _never_ready(fake, handle)  # PG §3.56: autoTrigger_ms 0 waits indefinitely
+    assert _get(fake, handle)[0] == STATUS["PICO_NO_SAMPLES_AVAILABLE"]  # PG §3.18
+    assert not buffers[A].any()
+    assert fake.ps2000aStop(handle) == (OK,)
+    assert fake.ps2000aIsReady(handle) == (OK, 0)
+    assert _get(fake, handle)[0] == STATUS["PICO_NO_SAMPLES_AVAILABLE"]
+    # a new run with a reachable level is fine
+    fake.ps2000aSetSimpleTrigger(handle, 1, A, 8128, "PS2000A_RISING", 0, 0)
+    assert fake.ps2000aRunBlock(handle, 100, 1900, 129, 0, 0)[0] == OK
+    while fake.ps2000aIsReady(handle)[1] == 0:
+        pass
+    assert _get(fake, handle)[0] == OK
+
+
+def test_unreachable_trigger_level_with_auto_trigger_completes_at_phase_037() -> None:
+    fake = FakePs2000a(clock_v=1.0, ready_after=3)
+    handle = _open(fake)
     threshold = round(1.5 / 2.0 * 32512)
-    buffers = _capture(fake, handle, trigger=(A, threshold, "PS2000A_FALLING"))
-    _get(fake, handle)
-    assert buffers[A][99] == 0
-    assert buffers[A][100] == 16256
+    buffers = _capture(fake, handle, trigger=(A, threshold, "PS2000A_RISING"), auto_ms=100)
+    assert _get(fake, handle)[:2] == (OK, 2000)
+    high = round(1.0 / 2.0 * 32512)
+    # arbitrary but deterministic: phase 0.37 of a 1000-sample period, so the clock is high at
+    # sample `pre` and falls at pre + 130 (0.37 + 0.13 = 0.5)
+    assert buffers[A][100] == high and buffers[A][100 + 129] == high
+    assert buffers[A][100 + 130] == 0
+    assert buffers[A][100 + 629] == 0 and buffers[A][100 + 630] == high  # next rising edge
+    again = FakePs2000a(clock_v=1.0, ready_after=3)
+    h2 = _open(again)
+    other = _capture(again, h2, trigger=(A, threshold, "PS2000A_RISING"), auto_ms=100)
+    _get(again, h2)
+    assert np.array_equal(other[A], buffers[A])  # deterministic
+
+
+@pytest.mark.parametrize(
+    ("direction", "level_v"),
+    [("PS2000A_ABOVE", -0.5), ("PS2000A_BELOW", 1.5)],
+)
+def test_level_condition_that_is_already_true_fires_at_once(direction: str, level_v: float) -> None:
+    fake = FakePs2000a(clock_v=1.0)
+    handle = _open(fake)
+    threshold = round(level_v / 2.0 * 32512)
+    buffers = _capture(fake, handle, trigger=(A, threshold, direction))  # polls: becomes ready
+    assert _get(fake, handle)[:2] == (OK, 2000)
+    assert buffers[A][100] == round(1.0 / 2.0 * 32512)  # arbitrary phase 0.37: clock is high
+
+
+def test_trigger_level_is_judged_against_the_source_channels_scaled_amplitude() -> None:
+    # channel B carries half the amplitude: 0.6 V is reachable on A but not on B
+    scale = {B: 0.5}
+    fake = FakePs2000a(clock_v=1.0, per_channel_scale=scale)
+    handle = _open(fake)
+    threshold = round(0.6 / 2.0 * 32512)
+    buffers = _capture(
+        fake,
+        handle,
+        channels=(A, B),
+        ranges=("PS2000A_2V", "PS2000A_2V"),
+        trigger=(A, threshold, "PS2000A_RISING"),
+    )
+    assert _get(fake, handle)[0] == OK
+    assert buffers[B].max() == round(0.5 / 2.0 * 32512)  # the scaled amplitude
+    fake2 = FakePs2000a(clock_v=1.0, per_channel_scale=scale)
+    h2 = _open(fake2)
+    _buffers = _capture(
+        fake2,
+        h2,
+        channels=(A, B),
+        ranges=("PS2000A_2V", "PS2000A_2V"),
+        trigger=(B, threshold, "PS2000A_RISING"),
+        poll=False,
+    )
+    assert _never_ready(fake2, h2)
 
 
 def test_disabled_trigger_after_enabled_one_resets_alignment() -> None:
@@ -919,8 +1008,9 @@ def test_clipping_sets_overflow_bit_per_channel() -> None:
     # both clip
     fake2 = FakePs2000a(clock_v=1.0)
     h2 = _open(fake2)
-    _capture(fake2, h2, channels=(A, B), ranges=("PS2000A_500MV", "PS2000A_200MV"))
+    buffers2 = _capture(fake2, h2, channels=(A, B), ranges=("PS2000A_500MV", "PS2000A_200MV"))
     assert _get(fake2, h2)[2] == 0b11
+    assert buffers2[A].max() == 32512
 
 
 def test_exact_full_scale_is_not_an_overflow() -> None:
@@ -1007,7 +1097,7 @@ def test_data_is_written_into_the_registered_array_in_place() -> None:
     assert buf.ctypes.data == address
     assert view.any()
     assert view[100] == 16256
-    assert fake.units[handle].buffers[A] is buf
+    assert fake.units[handle].buffers[A]() is buf
 
 
 def test_only_the_returned_samples_are_written() -> None:
@@ -1053,13 +1143,165 @@ def test_new_run_after_stop() -> None:
     assert _get(fake, handle)[0] == STATUS["PICO_NO_SAMPLES_AVAILABLE"]  # countdown restarted
 
 
-def test_settings_changed_after_run_do_not_alter_the_running_capture() -> None:
+def test_changing_settings_after_run_loses_the_data() -> None:
+    # PG §2.6.1 "Data retention": the data is lost when the settings are changed (Q18)
+    no_samples = STATUS["PICO_NO_SAMPLES_AVAILABLE"]
+    for change in (
+        lambda f, h: _channel(f, h, A, "PS2000A_20MV"),
+        lambda f, h: f.ps2000aSetSimpleTrigger(h, 1, A, 8128, "PS2000A_RISING", 0, 0),
+        lambda f, h: f.ps2000aSetSimpleTrigger(h, 0, A, 0, "PS2000A_RISING", 0, 0),
+    ):
+        fake = FakePs2000a()
+        handle = _open(fake)
+        buffers = _capture(fake, handle, ranges=("PS2000A_2V",))
+        change(fake, handle)
+        assert _get(fake, handle)[0] == no_samples
+        assert not buffers[A].any()
+        assert fake.ps2000aRunBlock(handle, 100, 1900, 129, 0, 0)[0] == OK  # a new run is fine
+        while fake.ps2000aIsReady(handle)[1] == 0:
+            pass
+        assert _get(fake, handle)[0] == OK
+
+
+def test_registering_a_buffer_or_stopping_after_run_keeps_the_data() -> None:
     fake = FakePs2000a()
     handle = _open(fake)
-    buffers = _capture(fake, handle, ranges=("PS2000A_2V",))
-    _channel(fake, handle, A, "PS2000A_20MV")
+    buffers = _capture(fake, handle)
+    spare = np.zeros(2000, dtype=np.int16)
+    assert fake.ps2000aSetDataBuffer(handle, A, spare, 0, NONE) == (OK,)
+    assert fake.ps2000aStop(handle) == (OK,)
+    assert _get(fake, handle)[0] == OK
+    assert spare.max() == 16256 and not buffers[A].any()  # written into the newest registration
+
+
+# --- MemorySegments -----------------------------------------------------------------------
+
+
+def test_memory_segments_one_segment_is_the_whole_memory() -> None:
+    fake = FakePs2000a(memory_samples=48000)
+    handle = _open(fake)
+    assert fake.ps2000aMemorySegments(handle, 1) == (OK, 48000)  # PG §3.29: total, all channels
+    assert fake.log[-1] == ("ps2000aMemorySegments", (handle, 1))
+    # the same figure GetTimebase2 gives for one enabled channel
+    _channel(fake, handle, A)
+    assert fake.ps2000aGetTimebase2(handle, 3, 100, 0, 0)[2] == 48000
+
+
+def test_memory_segments_argument_and_handle_rules() -> None:
+    fake = FakePs2000a()
+    handle = _open(fake)
+    assert fake.ps2000aMemorySegments(handle, 2) == (STATUS["PICO_TOO_MANY_SEGMENTS"], 0)
+    assert fake.ps2000aMemorySegments(handle, 0) == (STATUS["PICO_INVALID_PARAMETER"], 0)
+    assert fake.ps2000aMemorySegments(99, 1) == (STATUS["PICO_INVALID_HANDLE"], 0)
+    fake.reject["ps2000aMemorySegments"] = "PICO_BUSY"
+    assert fake.ps2000aMemorySegments(handle, 1) == (STATUS["PICO_BUSY"], 0)
+
+
+# --- strictness knobs (review R1): adc_bits, noise, per-channel scale, short read, info ------
+
+
+@pytest.mark.parametrize("bits", [8, 12, 16])
+def test_adc_bits_quantises_codes_to_multiples_of_a_power_of_two(bits: int) -> None:
+    step = 2 ** (16 - bits)
+    fake = FakePs2000a(adc_bits=bits, clock_v=0.3, noise_codes=2.0)
+    handle = _open(fake)
+    buffers = _capture(fake, handle)
+    assert _get(fake, handle)[2] == 0
+    raw = buffers[A].astype(np.int64)
+    assert (raw % step == 0).all()
+    assert abs(int(raw.max()) - round(0.3 / 2.0 * 32512)) <= step + 10  # amplitude + noise
+    assert len(np.unique(raw)) > 2 or step > 2  # noise still shows at 16 and 12 bits
+
+
+def test_adc_bits_full_scale_stays_reachable_and_clips_like_16_bits() -> None:
+    fake = FakePs2000a(adc_bits=8, clock_v=1.0)
+    handle = _open(fake)
+    buffers = _capture(fake, handle, ranges=("PS2000A_500MV",))  # overdriven
+    assert _get(fake, handle)[2] == 0b1
+    assert buffers[A].max() == 32512 and 32512 % 256 == 0
+
+
+@pytest.mark.parametrize("bits", [0, 17, -1])
+def test_adc_bits_must_be_in_1_to_16(bits: int) -> None:
+    with pytest.raises(ValueError, match="adc_bits"):
+        FakePs2000a(adc_bits=bits)
+
+
+def test_noise_is_gaussian_in_codes_seeded_and_off_by_default() -> None:
+    def low_samples(**kw: object) -> Int16Array:
+        fake = FakePs2000a(clock_v=1.0, **kw)  # type: ignore[arg-type]
+        handle = _open(fake)
+        buffers = _capture(fake, handle)
+        _get(fake, handle)
+        raw = buffers[A]
+        return raw[100:600].copy()  # the low... high half period after the trigger: constant
+
+    clean = low_samples()
+    assert len(np.unique(clean)) == 1  # no noise by default
+    noisy = low_samples(noise_codes=3.0, noise_seed=5)
+    assert 2.0 < float(noisy.std()) < 4.0
+    assert abs(float(noisy.mean()) - float(clean[0])) < 1.0
+    assert np.array_equal(noisy, low_samples(noise_codes=3.0, noise_seed=5))  # seeded
+    assert not np.array_equal(noisy, low_samples(noise_codes=3.0, noise_seed=6))
+    with pytest.raises(ValueError, match="noise_codes"):
+        FakePs2000a(noise_codes=-1.0)
+
+
+def test_noise_differs_between_channels() -> None:
+    fake = FakePs2000a(noise_codes=3.0)
+    handle = _open(fake)
+    buffers = _capture(fake, handle, channels=(A, B), ranges=("PS2000A_2V", "PS2000A_2V"))
     _get(fake, handle)
-    assert buffers[A].max() == 16256
+    assert not np.array_equal(buffers[A], buffers[B])
+
+
+def test_per_channel_scale_makes_a_channel_swap_detectable() -> None:
+    fake = FakePs2000a(clock_v=1.0, per_channel_scale={B: 0.5})
+    handle = _open(fake)
+    buffers = _capture(fake, handle, channels=(A, B), ranges=("PS2000A_2V", "PS2000A_2V"))
+    assert _get(fake, handle)[:2] == (OK, 2000)
+    assert buffers[A].max() == 16256  # 1 V on a 2 V range
+    assert buffers[B].max() == 8128  # 0.5 V
+    ramp = FakePs2000a(signal="ramp", clock_v=1.0, per_channel_scale={B: 2.0})
+    h2 = _open(ramp)
+    bufs = _capture(ramp, h2, channels=(A, B), ranges=("PS2000A_5V", "PS2000A_5V"))
+    _get(ramp, h2)
+    assert np.allclose(bufs[B].astype(float), 2 * bufs[A].astype(float), atol=1)
+
+
+def test_per_channel_scale_validation() -> None:
+    with pytest.raises(ValueError, match="unknown channel"):
+        FakePs2000a(per_channel_scale={"B": 0.5})
+    with pytest.raises(ValueError, match="must be a finite number > 0"):
+        FakePs2000a(per_channel_scale={B: 0.0})
+
+
+def test_short_read_returns_that_many_samples_and_writes_only_those() -> None:
+    fake = FakePs2000a(short_read=1500)
+    handle = _open(fake)
+    buffers = _capture(fake, handle)
+    status, n, _ = _get(fake, handle)
+    assert (status, n) == (OK, 1500)
+    assert buffers[A][:1500].any() and not buffers[A][1500:].any()
+    fake = FakePs2000a(short_read=5000)  # more than asked for: no effect
+    handle = _open(fake)
+    _buffers = _capture(fake, handle)
+    assert _get(fake, handle)[1] == 2000
+    with pytest.raises(ValueError, match="short_read"):
+        FakePs2000a(short_read=-1)
+
+
+def test_info_unavailable_names_return_pico_info_unavailable() -> None:
+    fake = FakePs2000a(info_unavailable={"PICO_CAL_DATE", "PICO_USB_VERSION"})
+    handle = _open(fake)
+    assert fake.ps2000aGetUnitInfo(handle, "PICO_CAL_DATE") == (
+        STATUS["PICO_INFO_UNAVAILABLE"],
+        "",
+    )
+    assert fake.ps2000aGetUnitInfo(handle, "PICO_USB_VERSION")[0] == STATUS["PICO_INFO_UNAVAILABLE"]
+    assert fake.ps2000aGetUnitInfo(handle, "PICO_VARIANT_INFO") == (OK, "2207BMSO")
+    with pytest.raises(ValueError, match="info_unavailable"):
+        FakePs2000a(info_unavailable={"PICO_NOPE"})
 
 
 # --- reject, log -------------------------------------------------------------------------
@@ -1081,8 +1323,42 @@ def test_every_call_is_logged_with_its_arguments_in_order() -> None:
     ]
     assert fake.log[0] == ("ps2000aOpenUnit", (None,))
     assert fake.log[1] == ("ps2000aSetChannel", (handle, A, 1, "PS2000A_DC", "PS2000A_1V", 0.0))
-    assert fake.log[2][1][2] is buf
+    assert fake.log[2][1][2] == ("ndarray", id(buf), 4)  # never the array itself (F1)
     assert fake.log[3] == ("ps2000aStop", (handle,))
+
+
+def test_registered_buffers_are_weak_and_the_log_does_not_keep_them_alive() -> None:
+    fake = FakePs2000a()
+    handle = _open(fake)
+    buf = np.zeros(4, dtype=np.int16)
+    fake.ps2000aSetDataBuffer(handle, A, buf, 0, NONE)
+    ref = fake.units[handle].buffers[A]
+    assert ref() is buf
+    del buf
+    assert ref() is None  # neither the log nor the unit holds a strong reference
+
+
+def test_get_values_fails_when_a_registered_array_died() -> None:
+    fake = FakePs2000a()
+    handle = _open(fake)
+    buffers = _capture(fake, handle, channels=(A, B), ranges=("PS2000A_2V", "PS2000A_2V"))
+    assert _get(fake, handle)[0] == OK
+    del buffers[B]  # the caller let channel B's array die: the driver's pointer dangles
+    assert _get(fake, handle) == (STATUS["PICO_INVALID_PARAMETER"], 0, 0)
+
+
+def test_get_values_fails_for_a_dead_array_of_a_disabled_channel_too() -> None:
+    # ASSUMPTION(hw) Q33: the driver may write to the buffer of a channel that is now disabled
+    fake = FakePs2000a()
+    handle = _open(fake)
+    buffers = _capture(fake, handle, channels=(A, B), ranges=("PS2000A_2V", "PS2000A_2V"))
+    _channel(fake, handle, B, enabled=0)
+    assert fake.ps2000aRunBlock(handle, 100, 1900, 127, 0, 0)[0] == OK
+    while fake.ps2000aIsReady(handle)[1] == 0:
+        pass
+    assert _get(fake, handle)[0] == OK
+    del buffers[B]
+    assert _get(fake, handle)[0] == STATUS["PICO_INVALID_PARAMETER"]
 
 
 def test_failed_calls_are_logged_too() -> None:

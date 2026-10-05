@@ -112,6 +112,10 @@ class Ps2000aApi(Protocol):
 
     def ps2000aStop(self, handle: int) -> tuple[int]: ...  # PG §3.65
 
+    def ps2000aMemorySegments(
+        self, handle: int, nSegments: int
+    ) -> tuple[int, int]: ...  # status, nMaxSamples (all channels)  PG §3.29
+
 
 def _checked(value: int, lo: int, hi: int, what: str) -> int:
     """Return `value` if it fits the C type's range, else `ValueError` (ctypes would wrap)."""
@@ -164,8 +168,15 @@ class PicosdkApi(Ps2000aApi):
 
     def _enum(self, table: str, name: str) -> int:
         """Resolve an enum member name through the dict picosdk keeps on the library object."""
+        library = self._library()
         try:
-            return int(getattr(self._library(), table)[name])
+            members = getattr(library, table)
+        except AttributeError:
+            raise ValueError(
+                f"the library has no enum table {table} (looking up {name!r})"
+            ) from None
+        try:
+            return int(members[name])
         except (KeyError, TypeError):
             raise ValueError(f"unknown {table} member {name!r}") from None
 
@@ -361,3 +372,13 @@ class PicosdkApi(Ps2000aApi):
     def ps2000aStop(self, handle: int) -> tuple[int]:  # PG §3.65
         fn = self._fn("ps2000aStop")
         return (int(fn(c_int16(_i16(handle, "handle")))),)
+
+    def ps2000aMemorySegments(self, handle: int, nSegments: int) -> tuple[int, int]:  # PG §3.29
+        fn = self._fn("ps2000aMemorySegments")
+        n_max_samples = c_int32(0)  # out: samples per segment, summed over all channels
+        status = fn(
+            c_int16(_i16(handle, "handle")),
+            c_uint32(_u32(nSegments, "nSegments")),
+            byref(n_max_samples),
+        )
+        return int(status), int(n_max_samples.value)

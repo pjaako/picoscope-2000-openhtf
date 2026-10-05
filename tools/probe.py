@@ -47,6 +47,20 @@ def _fmt(value: object) -> str:
     return repr(value)
 
 
+def _modulo_stats(raw: npt.NDArray[np.int16]) -> str:
+    """Statistics of ``raw % 256`` (open question 32: an 8-bit ADC gives multiples of 256)."""
+    residues = raw.astype(np.int64) % 256
+    values, counts = np.unique(residues, return_counts=True)
+    top = int(values[int(np.argmax(counts))])
+    multiples = int(np.count_nonzero(residues == 0))
+    return (
+        f"raw % 256: {multiples} of {raw.size} samples are multiples of 256, "
+        f"{values.size} distinct residues, most common residue {top} "
+        f"({int(counts.max())} samples), all multiples of 256: "
+        f"{'yes' if multiples == raw.size else 'no'}"
+    )
+
+
 class Recorder:
     """Wraps any `Ps2000aApi` and logs every call: -> name(args), <- STATUS, !! error.
 
@@ -184,6 +198,7 @@ class Probe:
                     0.0,
                 )
             rows: list[str] = []
+            max_samples_seen: list[int] = []
             for n in TIMEBASES:
                 result = self.call(
                     "ps2000aGetTimebase2",  # PG §3.14
@@ -197,12 +212,28 @@ class Probe:
                     rows.append(f"n={n}: raised")
                     continue
                 status, interval_ns, max_samples = result
+                if status_name(status) == "PICO_OK":
+                    max_samples_seen.append(max_samples)
                 rows.append(
                     f"n={n}: {status_name(status)}, interval {interval_ns:g} ns, "
                     f"maxSamples {max_samples}"
                 )
             notes.append(f"{label}, noSamples {TIMEBASE_SAMPLES}:")
             notes += [f"  {row}" for row in rows]
+            # Q31 (docs/api_reference.md): compare the per-channel maxSamples above with the
+            # total over all channels that ps2000aMemorySegments reports for one segment (PG §3.29).
+            # Asking for 1 segment is the state after OpenUnit, so it changes nothing.
+            segments = self.call("ps2000aMemorySegments", handle, 1)  # PG §3.29
+            if segments is None:
+                notes.append("  ps2000aMemorySegments raised")
+            else:
+                status, n_max_samples = segments
+                seen = f"maxSamples {sorted(set(max_samples_seen))}" if max_samples_seen else "none"
+                notes.append(
+                    f"  ps2000aMemorySegments(1): {status_name(status)}, nMaxSamples "
+                    f"{n_max_samples} (total over all channels, PG §3.29) next to {seen} above "
+                    "(open question 31: a digital port may take a share of the memory)"
+                )
         return notes
 
     def item_5_ranges(self) -> list[str]:
@@ -226,7 +257,7 @@ class Probe:
             f"rejected: {', '.join(rejected) or 'none'}",
         ]
 
-    def _capture(self, capture: Capture) -> list[str]:
+    def _capture(self, capture: Capture, *, adc_stats: bool = False) -> list[str]:
         plug = self.open_plug()
         notes: list[str] = []
         try:
@@ -248,6 +279,8 @@ class Probe:
                     f"raw max {int(raw.max())}, mean {statistics.fmean(raw.tolist()):.1f}, "
                     f"overflow bit {int(w.meta.overflow)}"
                 )
+                if adc_stats:
+                    notes.append(f"channel {ch}: {_modulo_stats(raw)}")
                 if capture.trigger is not None:
                     pre = capture.pre_samples
                     around = raw[max(0, pre - 5) : pre + 6].tolist()
@@ -269,7 +302,8 @@ class Probe:
                 sample_interval=1 * us,
                 pre_samples=0,
                 post_samples=CAPTURE_SAMPLES,
-            )
+            ),
+            adc_stats=True,  # open question 32: are the codes multiples of 256 (8-bit ADC)?
         )
 
     def item_7_capture_rising(self) -> list[str]:

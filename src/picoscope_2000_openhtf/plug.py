@@ -39,16 +39,26 @@ __all__ = [
 
 CONF = configuration.CONF
 
+
+def _declare(name: str, default_value: object, description: str) -> None:
+    """Declare a CONF key once; a module reload must not raise `KeyAlreadyDeclaredError`."""
+    try:
+        CONF.declare(name, default_value=default_value, description=description)
+    except configuration.KeyAlreadyDeclaredError:
+        pass
+
+
 # Declared at import; set values with ``CONF.load(...)`` only after importing this module.
-CONF.declare(
+_declare(
     "picoscope_2000_serial",
-    default_value=None,
-    description="Serial number of the PicoScope to open (None: the first unit found)",
+    None,
+    "Serial number of the PicoScope to open (None: the first unit found)",
 )
-CONF.declare(
+_declare(
     "picoscope_2000_timeout_s",
-    default_value=10.0,
-    description="Default time in seconds wait_ready() waits for the capture to finish",
+    10.0,
+    "Default time in seconds wait_ready() waits for the capture to finish "
+    "(the capture's own time_indisposed_ms is added)",
 )
 
 _PICO_OK = "PICO_OK"  # PG §4.1
@@ -76,12 +86,16 @@ _ANALOG_OFFSET = 0.0  # PG §3.39: analog offset is outside phase 1
 _NO_TRIGGER_SOURCE = "PS2000A_CHANNEL_A"  # PG §3.56
 _NO_TRIGGER_DIRECTION = "PS2000A_RISING"  # PG §3.56
 _RATIO_NONE = "PS2000A_RATIO_MODE_NONE"  # PG §3.18, §3.40: raw data, the ratio is ignored
+# ASSUMPTION(hw) Q34 (proposed, not yet in docs/api_reference.md): with RATIO_MODE_NONE the
+# manual says the ratio is ignored (PG §3.18); 1 is sent and is assumed to be accepted.
+_DOWNSAMPLE_RATIO = 1
 _SEGMENT = 0  # PG §3.29: one memory segment in phase 1
 # ASSUMPTION(hw): 0 is a safe value for `oversample`, which the manual calls "not used"
 # in §3.14 and §3.37 (open question 12).
 _OVERSAMPLE = 0
 
-_MAX_TIMEBASE_CALLS = 64  # SPEC §4 step 2: cap of the timebase search
+_MAX_PROBES_AFTER_VALID = 8  # SPEC §4 step 2: cap of the timebase search after a valid probe
+_MAX_TIMEBASE = 2**32 - 1  # PG §3.37: timebase is "a number in the range 0 to 2^32 - 1"
 _INTERVAL_REL_TOL = 1e-6  # SPEC §4 step 2: the driver returns a C float (PG §3.14)
 _ALL_CHANNELS = (1, 2, 3, 4)  # PG §3.39: channels A..D
 
@@ -90,13 +104,18 @@ class PicoError(RuntimeError):
     """A driver call did not return `PICO_OK` (PG §4.1)."""
 
     def __init__(self, function: str, status: int, name: str, detail: str = "") -> None:
-        message = f"{function} returned {name} (0x{status & 0xFFFFFFFF:08X})"
-        if detail:
-            message += f": {detail}"
-        super().__init__(message)
+        # `args` holds the constructor arguments, so copy and pickle rebuild the exception.
+        super().__init__(function, status, name, detail)
         self.function = function
         self.status = status
         self.name = name
+        self.detail = detail
+
+    def __str__(self) -> str:
+        message = f"{self.function} returned {self.name} (0x{self.status & 0xFFFFFFFF:08X})"
+        if self.detail:
+            message += f": {self.detail}"
+        return message
 
 
 class CaptureError(RuntimeError):
@@ -129,9 +148,11 @@ class Waveform(NamedTuple):
 
 def waveform_from_raw(raw: npt.NDArray[np.int16], meta: WaveformMeta) -> Waveform:
     """Build a `Waveform`: keep `raw`, recompute `t` and `v` from `meta`."""
-    # ASSUMPTION(hw): the trigger point is sample index pre_samples; PG §3.37 says the maximum
-    # number returned is pre + post but not where the trigger sample sits (no matching item in
-    # "Open questions", nearest is 15; reported to the owner).
+    if not isinstance(raw, np.ndarray) or raw.dtype != np.int16:
+        dtype = getattr(raw, "dtype", type(raw).__name__)
+        raise ValueError(f"raw must be a numpy int16 array (ADC counts), got {dtype}")
+    # ASSUMPTION(hw) Q30: the trigger point is sample index pre_samples; PG §3.37 says the
+    # maximum number returned is pre + post but not where the trigger sample sits.
     t = (np.arange(len(raw)) - meta.pre_samples) * meta.sample_interval_s
     v = raw.astype(np.float64) * (
         meta.range_v / meta.max_adc
@@ -162,8 +183,8 @@ def _at_least(interval: float, requested: float) -> bool:
 
 def _estimate_timebase(interval_s: float) -> int:
     """First guess of the timebase for a sample interval, from the 1 GS/s table of PG §2.7."""
-    # ASSUMPTION(hw): the 2207B MSO is a 1 GS/s model; the search in apply_capture makes the
-    # result correct either way (open question 1).
+    # ASSUMPTION(hw) Q1: the 2207B MSO is a 1 GS/s model; the search in apply_capture makes the
+    # result correct either way.
     if interval_s <= 1 * ns:
         return 0  # PG §2.7: n = 0 is 1 ns
     if interval_s <= 2 * ns:
@@ -218,14 +239,25 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
         self.sample_interval_s: float | None = None
         self.max_samples: int | None = None
         self.time_indisposed_ms: int = 0
-        self._buffers: dict[int, npt.NDArray[np.int16]] = {}
+        # Every array ever registered with ps2000aSetDataBuffer, by channel. The driver keeps the
+        # raw pointer (PG §3.40), so an array must stay referenced for the life of the plug; an
+        # entry is replaced only right after its own successful registration (SPEC §4 step 5).
+        self._registered: dict[int, npt.NDArray[np.int16]] = {}
         self._armed = False
         self._ready = False
+        self._stopped = False  # stop() or a timeout ended a capture whose data was never fetched
         self._values: tuple[int, int] | None = None  # (noOfSamples, overflow) of the last fetch
 
         status, count, serials = self._api.ps2000aEnumerateUnits()  # PG §3.4
-        _check("ps2000aEnumerateUnits", status)
-        self.logger.info("found %d unopened unit(s): %s", count, serials)
+        if _is(status, _PICO_OK):
+            self.logger.info("found %d unopened unit(s): %s", count, serials)
+        else:
+            # Enumeration is informational: opening by serial does not depend on it.
+            self.logger.warning(
+                "ps2000aEnumerateUnits returned %s; continuing without the unit list",
+                status_name(status),
+            )
+            count, serials = 0, ""
         if serial is None and count > 1:
             self.logger.warning(
                 "no serial given and %d units found (%s); opening the first one. "
@@ -235,7 +267,13 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
             )
 
         status, handle = self._api.ps2000aOpenUnit(serial)  # PG §3.32
-        _check("ps2000aOpenUnit", status)
+        if not _is(status, _PICO_OK):
+            if handle > 0:
+                # ASSUMPTION(hw) Q10: the manual does not say how status and handle combine; a
+                # handle > 0 next to an error status may be an open unit, so it is closed.
+                self._handle = handle
+                self._close_unit()
+            raise PicoError("ps2000aOpenUnit", status, status_name(status))
         if handle <= 0:
             # PG §3.32: handle 0 means no scope was found, -1 that the scope failed to open.
             # ASSUMPTION(hw): the manual does not say how status and handle combine; a PICO_OK
@@ -251,8 +289,12 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
         try:
             for name in _INFO_NAMES:
                 status, text = self._api.ps2000aGetUnitInfo(handle, name)  # PG §3.17
-                if _is(status, "PICO_INFO_UNAVAILABLE"):
-                    self.info[name] = ""  # PG §3.17 Returns
+                if _is(status, "PICO_INFO_UNAVAILABLE") or _is(status, "PICO_INVALID_INFO"):
+                    # PG §3.17 Returns: either code means "no such string"; not worth a failure
+                    self.logger.warning(
+                        "%s: ps2000aGetUnitInfo returned %s", name, status_name(status)
+                    )
+                    self.info[name] = ""
                     continue
                 _check("ps2000aGetUnitInfo", status)
                 self.info[name] = text
@@ -320,6 +362,7 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
     def _forget_data(self) -> None:
         self._armed = False
         self._ready = False
+        self._stopped = False
         self._values = None
 
     # -- capture ----------------------------------------------------------------------------
@@ -339,13 +382,20 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
             if ch in enabled:
                 channel = capture.channel(ch)
                 args = (name, 1, COUPLINGS[channel.coupling], RANGES[channel.range], _ANALOG_OFFSET)
+            elif ch in (3, 4) and self.channel_count == 2:
+                continue  # an earlier call showed that the unit has no such channel
             else:
                 args = (name, 0, _DISABLED_COUPLING, _DISABLED_RANGE, _ANALOG_OFFSET)
             (status,) = self._call("ps2000aSetChannel", handle, *args)  # PG §3.39
-            if _is(status, "PICO_INVALID_CHANNEL") and ch in (3, 4) and ch not in enabled:
-                # ASSUMPTION(hw): disabling a channel the unit does not have gives
-                # PICO_INVALID_CHANNEL, which means a two-channel unit (open question 21).
-                self.logger.info("%s rejected as invalid: two-channel unit", name)
+            if not _is(status, _PICO_OK) and ch in (3, 4) and ch not in enabled:
+                # ASSUMPTION(hw) Q21, Q33: disabling a channel the unit does not have is refused
+                # (PICO_INVALID_CHANNEL in the fake; the manual does not say which status), and
+                # that means a two-channel unit.
+                self.logger.info(
+                    "%s refused with %s while disabling it: two-channel unit",
+                    name,
+                    status_name(status),
+                )
                 self.channel_count = 2
                 continue
             _check("ps2000aSetChannel", status)
@@ -353,7 +403,7 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
         # Step 2: timebase search (PG §2.7, §3.14), step 3: the sample count must fit.
         total = capture.total_samples
         timebase, interval_s, max_samples = self._find_timebase(
-            handle, total, capture.sample_interval
+            handle, total, capture.sample_interval, enabled
         )
         if total > max_samples:
             raise CaptureError(
@@ -388,10 +438,12 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
             )
         _check("ps2000aSetSimpleTrigger", status)
 
-        # Step 5: one int16 buffer per enabled channel (PG §3.40). ASSUMPTION(hw): buffers
-        # registered before ps2000aRunBlock survive until ps2000aGetValues (open question 18);
-        # bufferLth counts samples (open question 19).
-        buffers: dict[int, npt.NDArray[np.int16]] = {}
+        # Step 5: one int16 buffer per enabled channel (PG §3.40). ASSUMPTION(hw) Q18: buffers
+        # registered before ps2000aRunBlock survive until ps2000aGetValues; Q19: bufferLth counts
+        # samples. Lifetime rule: the driver keeps the raw pointer, so each array goes into
+        # `_registered` right after its own successful call and is never dropped, even when a
+        # later channel fails or a later capture enables fewer channels (Q33: the driver may
+        # write to the buffer of a disabled channel).
         for ch in enabled:
             buffer = np.zeros(total, dtype=np.int16)
             (status,) = self._call(
@@ -403,14 +455,13 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
                 _RATIO_NONE,
             )
             _check("ps2000aSetDataBuffer", status)
-            buffers[ch] = buffer
+            self._registered[ch] = buffer
 
         # Step 6: the resolved state.
         self.capture = capture
         self.timebase = timebase
         self.sample_interval_s = interval_s
         self.max_samples = max_samples
-        self._buffers = buffers
         self.logger.info(
             "capture applied: channels %s, timebase %d (%g s per sample), %d samples",
             list(enabled),
@@ -419,21 +470,21 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
             total,
         )
 
-    def _find_timebase(self, handle: int, total: int, requested_s: float) -> tuple[int, float, int]:
-        """Smallest timebase whose interval is >= `requested_s`: (n, interval_s, maxSamples)."""
-        calls = 0
-        known: dict[int, _TimebaseResult | None] = {}  # None: the driver said "too small"
+    def _find_timebase(
+        self, handle: int, total: int, requested_s: float, enabled: tuple[int, ...]
+    ) -> tuple[int, float, int]:
+        """Smallest timebase whose interval is >= `requested_s`: (n, interval_s, maxSamples).
 
-        def probe(n: int, *, tolerate_any: bool, tolerate_invalid: bool) -> _TimebaseResult | None:
-            nonlocal calls
-            if n in known:
-                return known[n]
-            if calls >= _MAX_TIMEBASE_CALLS:
-                raise CaptureError(
-                    f"no timebase for a sample interval of {requested_s:g} s found within "
-                    f"{_MAX_TIMEBASE_CALLS} ps2000aGetTimebase2 calls"
-                )
-            calls += 1
+        SPEC §4 step 2: probe the estimate (tolerating a refusal for n = 0, 1, 2), re-estimate
+        from the first valid probe with the linear law of PG §2.7 (`interval = (n - 2) / rate`
+        for n >= 3, in both tables), then refine by one step at a time. At most
+        `_MAX_PROBES_AFTER_VALID` further `ps2000aGetTimebase2` calls.
+        """
+        known: dict[int, _TimebaseResult | None] = {}  # None: n is "too small" (invalid)
+        after_valid = 0
+
+        def call(n: int) -> tuple[int, _TimebaseResult | None]:
+            """One GetTimebase2 call: (status, result), result None unless usable."""
             status, interval_ns, max_samples = self._call(
                 "ps2000aGetTimebase2",  # PG §3.14
                 handle,
@@ -442,35 +493,81 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
                 _OVERSAMPLE,
                 _SEGMENT,
             )
-            # ASSUMPTION(hw): on PICO_TOO_MANY_SAMPLES both outputs are filled in, so the
-            # search can finish and the plug names both numbers (open question 26).
-            if _is(status, _PICO_OK) or (_is(status, "PICO_TOO_MANY_SAMPLES") and max_samples > 0):
-                known[n] = _TimebaseResult(interval_ns * ns, int(max_samples))
-            elif tolerate_any or (tolerate_invalid and _is(status, "PICO_INVALID_TIMEBASE")):
-                # ASSUMPTION(hw): an unavailable timebase (e.g. n = 0 with two channels, PG §2.7
-                # footnote) is reported as PICO_INVALID_TIMEBASE (PG §3.14 Returns) and means
-                # n is too small for the enabled channels (open questions 2 and 20).
-                self.logger.info("timebase %d rejected: %s", n, status_name(status))
-                known[n] = None
-            else:
-                raise PicoError("ps2000aGetTimebase2", status, status_name(status))
-            return known[n]
+            # ASSUMPTION(hw) Q26: on PICO_TOO_MANY_SAMPLES both outputs are filled in, so the
+            # search can finish and the plug names both numbers.
+            if _is(status, "PICO_TOO_MANY_SAMPLES"):
+                if max_samples <= 0:
+                    raise CaptureError(
+                        f"{total} samples requested but ps2000aGetTimebase2 reports "
+                        f"maxSamples {max_samples} for timebase {n} (PICO_TOO_MANY_SAMPLES) "
+                        f"with channels {list(enabled)}"
+                    )
+                return status, _TimebaseResult(interval_ns * ns, int(max_samples))
+            if _is(status, _PICO_OK):
+                return status, _TimebaseResult(interval_ns * ns, int(max_samples))
+            return status, None
 
-        n = _estimate_timebase(requested_s)
-        seen_valid = False
-        first = True
-        while True:  # up: from "too small" to the first interval >= requested
-            candidate = probe(n, tolerate_any=first, tolerate_invalid=not seen_valid)
-            first = False
-            if candidate is not None:
-                seen_valid = True
-                if _at_least(candidate.interval_s, requested_s):
-                    found = candidate
-                    break
+        def probe(n: int) -> _TimebaseResult | None:
+            """A probe after the first valid one; `n < 3` may legitimately be refused."""
+            nonlocal after_valid
+            if n in known:
+                return known[n]
+            if after_valid >= _MAX_PROBES_AFTER_VALID:
+                raise CaptureError(
+                    f"no timebase for a sample interval of {requested_s:g} s found within "
+                    f"{_MAX_PROBES_AFTER_VALID} ps2000aGetTimebase2 calls after the first "
+                    "valid one"
+                )
+            after_valid += 1
+            status, result = call(n)
+            if result is None:
+                if n < 3 and _is(status, "PICO_INVALID_TIMEBASE"):
+                    # ASSUMPTION(hw) Q2, Q20: a timebase the enabled channels cannot use
+                    # (n = 0 with two channels, PG §2.7 footnote) is PICO_INVALID_TIMEBASE
+                    # (PG §3.14 Returns) and means "n is too small".
+                    self.logger.info("timebase %d rejected: %s", n, status_name(status))
+                else:
+                    raise PicoError("ps2000aGetTimebase2", status, status_name(status))
+            known[n] = result
+            return result
+
+        # Step A: the first valid probe, from the estimate. ASSUMPTION(hw) Q2, Q20: a refusal
+        # of n = 0, 1, 2 (e.g. n = 0 needs single-channel mode, PG §2.7 footnote) is skipped.
+        n = min(_estimate_timebase(requested_s), _MAX_TIMEBASE)
+        while True:
+            status, first = call(n)
+            known[n] = first
+            if first is not None:
+                break
+            if n >= 3:
+                raise PicoError("ps2000aGetTimebase2", status, status_name(status))
+            self.logger.info("timebase %d rejected: %s", n, status_name(status))
             n += 1
-        while n > 0:  # down: is the next smaller timebase still long enough?
-            smaller = probe(n - 1, tolerate_any=False, tolerate_invalid=True)
-            if smaller is None or not _at_least(smaller.interval_s, requested_s):
+
+        # Step B: linear re-estimate from the first valid probe (PG §2.7: interval is linear
+        # in n - 2 for n >= 3 in both tables), then refine one step at a time.
+        if first.interval_s <= 0:
+            raise CaptureError(
+                f"ps2000aGetTimebase2 returned a sample interval of {first.interval_s:g} s "
+                f"for timebase {n}"
+            )
+        if n >= 3:
+            n = min(
+                2 + max(1, math.ceil((n - 2) * requested_s / first.interval_s - 1e-9)),
+                _MAX_TIMEBASE,
+            )
+        found = probe(n)
+        while found is None or not _at_least(found.interval_s, requested_s):  # too short: up
+            if n >= _MAX_TIMEBASE:
+                raise CaptureError(
+                    f"a sample interval of {requested_s:g} s is longer than the slowest "
+                    f"timebase {_MAX_TIMEBASE} (PG §3.37)"
+                )
+            n += 1
+            found = probe(n)
+        while n > 0:  # is the next smaller timebase still long enough? (no tolerance here)
+            smaller = probe(n - 1)
+            if smaller is None or smaller.interval_s < requested_s:
                 break
             n, found = n - 1, smaller
         return n, found.interval_s, found.max_samples
@@ -498,30 +595,39 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
     def wait_ready(self, timeout_s: float | None = None, poll_s: float = 0.01) -> None:
         """Poll `ps2000aIsReady` until the capture is done (PG §3.26).
 
-        On expiry of the deadline the capture is stopped (PG §3.65) and `TimeoutError` raised.
+        The deadline is `timeout_s` (default: the plug's) plus `time_indisposed_ms` of the last
+        `single()`: PG §3.37 says the capture itself takes that long, without any auto-trigger
+        wait. On expiry the capture is stopped (PG §3.65) and `TimeoutError` raised.
         """
         handle = self._open_handle()
         if not self._armed:
             raise RuntimeError("no capture armed; call single() first")
         limit = self._timeout_s if timeout_s is None else float(timeout_s)
+        limit += self.time_indisposed_ms / 1000  # PG §3.37
         deadline = time.monotonic() + limit
+        self.logger.debug("polling ps2000aIsReady (PG §3.26) for up to %g s", limit)
+        polls = 0
         while True:
-            status, ready = self._call("ps2000aIsReady", handle)  # PG §3.26
+            polls += 1
+            status, ready = self._api.ps2000aIsReady(handle)  # PG §3.26; logged once, not per poll
             _check("ps2000aIsReady", status)
             if ready != 0:  # PG §3.26: non-zero, ps2000aGetValues can be used
+                self.logger.debug("ps2000aIsReady: ready after %d poll(s)", polls)
                 self._ready = True
                 return
             if time.monotonic() >= deadline:
                 break
             time.sleep(poll_s)
+        self.logger.debug("ps2000aIsReady: not ready after %d poll(s)", polls)
         self._forget_data()
+        self._stopped = True
         try:
             (status,) = self._call("ps2000aStop", handle)  # PG §3.65: stops while waiting
             if not _is(status, _PICO_OK):
                 self.logger.warning("ps2000aStop returned %s", status_name(status))
         except Exception:
             self.logger.warning("ps2000aStop failed", exc_info=True)
-        raise TimeoutError(f"no trigger within {limit:g} s")
+        raise TimeoutError(f"capture not ready within {limit:g} s")
 
     def read_waveform(self, ch: int) -> Waveform:
         """Waveform of channel `ch` of the finished capture.
@@ -535,6 +641,11 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
             raise RuntimeError("no capture applied; call apply_capture() first")
         if self._values is None:
             if not self._armed:
+                if self._stopped:
+                    raise RuntimeError(
+                        "the capture was stopped before its data was read (PG §3.65: the data "
+                        "is invalid after ps2000aStop); call single() to capture again"
+                    )
                 raise RuntimeError("no capture armed; call single() first")
             if not self._ready:
                 raise RuntimeError("capture not finished; call wait_ready() first")
@@ -546,11 +657,17 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
                 handle,
                 0,
                 capture.total_samples,
-                1,
+                _DOWNSAMPLE_RATIO,
                 _RATIO_NONE,
                 _SEGMENT,
             )
             _check("ps2000aGetValues", status)
+            if n_samples < capture.total_samples:
+                self.logger.warning(
+                    "ps2000aGetValues returned %d of the %d requested samples",
+                    n_samples,
+                    capture.total_samples,
+                )
             self._values = (int(n_samples), int(overflow))
         n_samples, overflow = self._values
         meta = WaveformMeta(
@@ -561,11 +678,12 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
             sample_interval_s=self.sample_interval_s,
             pre_samples=capture.pre_samples,
             timebase=self.timebase,
-            overflow=bool((overflow >> (ch - 1)) & 1),  # PG §3.18: bit 0 = channel A
+            # PG §3.18: bit 0 = channel A. ASSUMPTION(hw) Q7: channel B..D are bits 1..3.
+            overflow=bool((overflow >> (ch - 1)) & 1),
             serial=self.serial,
             variant=self.variant,
         )
-        return waveform_from_raw(self._buffers[ch][:n_samples].copy(), meta)
+        return waveform_from_raw(self._registered[ch][:n_samples].copy(), meta)
 
     def stop(self) -> None:
         """Stop the running capture (PG §3.65). Data already fetched stays readable."""
@@ -575,6 +693,7 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]  # OpenHTF is untyped
         # (open question 8).
         (status,) = self._call("ps2000aStop", handle)  # PG §3.65
         _check("ps2000aStop", status)
+        self._stopped = self._armed and self._values is None  # armed, never fetched: data gone
         self._armed = False
         self._ready = False
 

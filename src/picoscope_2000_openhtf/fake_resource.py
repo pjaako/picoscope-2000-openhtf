@@ -13,7 +13,8 @@ verification"; hardware acceptance corrects this file to match the real unit. Ci
 """
 
 import math
-from collections.abc import Mapping, Sequence
+import weakref
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -37,6 +38,7 @@ STATUS: Mapping[str, int] = {
     "PICO_INVALID_CHANNEL": 0x00000010,  # PicoStatus.h via picosdk.constants
     "PICO_INVALID_TRIGGER_CHANNEL": 0x00000011,  # PicoStatus.h via picosdk.constants
     "PICO_TOO_MANY_SAMPLES": 0x0000001D,  # PicoStatus.h via picosdk.constants
+    "PICO_TOO_MANY_SEGMENTS": 0x0000001E,  # PicoStatus.h via picosdk.constants
     "PICO_NO_SAMPLES_AVAILABLE": 0x00000025,  # PicoStatus.h via picosdk.constants
     "PICO_SEGMENT_OUT_OF_RANGE": 0x00000026,  # PicoStatus.h via picosdk.constants
     "PICO_BUSY": 0x00000027,  # PicoStatus.h via picosdk.constants
@@ -136,6 +138,7 @@ _FIXED_INFO: Mapping[str, str] = {
 
 _CLOCK_EDGE_TOLERANCE = 1e-9  # cycles; keeps a sample exactly on an edge on the intended side
 _GLITCH_OFFSET = 7  # SPEC §6: the glitch replaces the sample at index pre + 7
+_ARBITRARY_PHASE = 0.37  # SPEC §6: clock phase (cycles) when the trigger point is arbitrary
 
 
 @dataclass
@@ -170,7 +173,9 @@ class FakeUnit:
     n_channels: int
     channels: dict[str, ChannelConfig] = field(default_factory=dict)
     trigger: TriggerConfig = field(default_factory=TriggerConfig)
-    buffers: dict[str, npt.NDArray[np.int16]] = field(default_factory=dict)
+    # Weak references: the real driver keeps a raw pointer (PG §3.40), not a reference, so a
+    # registered array that the caller let die is a dangling pointer there.
+    buffers: dict[str, "weakref.ReferenceType[npt.NDArray[np.int16]]"] = field(default_factory=dict)
     armed: bool = False  # RunBlock called, Stop not yet (PG §3.65)
     has_run: bool = False  # a RunBlock has been accepted
     polls_left: int = 0  # IsReady polls that still return 0
@@ -179,6 +184,8 @@ class FakeUnit:
     timebase: int = 0
     run_channels: dict[str, ChannelConfig] = field(default_factory=dict)  # snapshot at RunBlock
     phase: float = 0.0  # clock phase in cycles chosen by the trigger at RunBlock
+    never_ready: bool = False  # the trigger can never fire and no auto trigger is set
+    data_valid: bool = False  # cleared by a settings change after RunBlock (PG §2.6.1)
 
 
 class FakePs2000a:
@@ -201,6 +208,12 @@ class FakePs2000a:
         memory_samples: int = 65536,
         max_rate_hz: float = 1e9,
         ready_after: int = 2,
+        adc_bits: int = 16,
+        noise_codes: float = 0.0,
+        noise_seed: int = 0,
+        per_channel_scale: Mapping[str, float] | None = None,
+        short_read: int | None = None,
+        info_unavailable: Iterable[str] = (),
     ) -> None:
         problems: list[str] = []
         if len(set(serials)) != len(serials):
@@ -217,6 +230,23 @@ class FakePs2000a:
             problems.append("max_rate_hz must be > 0")
         if ready_after < 0:
             problems.append("ready_after must be >= 0")
+        if not 1 <= adc_bits <= 16:
+            problems.append("adc_bits must be in 1..16")
+        if not (math.isfinite(noise_codes) and noise_codes >= 0):
+            problems.append("noise_codes must be a finite number >= 0")
+        scale = dict(per_channel_scale or {})
+        for channel, factor in scale.items():
+            if channel not in CHANNELS:
+                problems.append(f"per_channel_scale: unknown channel {channel!r}")
+            elif not (math.isfinite(factor) and factor > 0):
+                problems.append(f"per_channel_scale[{channel!r}] must be a finite number > 0")
+        if short_read is not None and short_read < 0:
+            problems.append("short_read must be None or >= 0")
+        unavailable = set(info_unavailable)
+        if not unavailable <= set(_INFO_NAMES):
+            problems.append(
+                f"info_unavailable: unknown info names {sorted(unavailable - set(_INFO_NAMES))}"
+            )
         if problems:
             raise ValueError("invalid FakePs2000a arguments: " + "; ".join(problems))
         self._serials = tuple(serials)
@@ -231,6 +261,15 @@ class FakePs2000a:
         self.memory_samples = int(memory_samples)
         self.max_rate_hz = float(max_rate_hz)
         self.ready_after = int(ready_after)
+        # Strictness knobs (review R1): quantisation of the codes, noise (standard deviation in
+        # ADC codes, seeded), a different clock amplitude per channel so that a swap of two
+        # channels' data is detectable, a short GetValues, and info strings that are missing.
+        self.adc_bits = int(adc_bits)
+        self.noise_codes = float(noise_codes)
+        self.per_channel_scale: dict[str, float] = scale
+        self.short_read = short_read
+        self.info_unavailable: set[str] = unavailable
+        self._rng = np.random.default_rng(noise_seed)
         self.log: list[tuple[str, tuple[object, ...]]] = []
         self.reject: dict[str, str] = {}  # function name -> STATUS name, sticky
         self.units: dict[int, FakeUnit] = {}
@@ -240,8 +279,17 @@ class FakePs2000a:
     # -- helpers ---------------------------------------------------------------------------
 
     def _begin(self, name: str, *args: object) -> int | None:
-        """Log the call, then return the status `reject` asks for (None: run the call)."""
-        self.log.append((name, args))
+        """Log the call, then return the status `reject` asks for (None: run the call).
+
+        Numpy arguments are logged as `("ndarray", id, len)`, never as the array, so the log
+        does not keep a registered buffer alive.
+        """
+        self.log.append(
+            (
+                name,
+                tuple(("ndarray", id(a), len(a)) if isinstance(a, np.ndarray) else a for a in args),
+            )
+        )
         status_name = self.reject.get(name)
         if status_name is None:
             return None
@@ -252,9 +300,9 @@ class FakePs2000a:
         return [s for s in self._serials if s not in open_serials]
 
     def _n_analog_channels(self) -> int:
-        # ASSUMPTION(hw): the variant string format is not in the manual (PG §3.17 example
-        # "2206"). PG §1.1 lists 2405A..2408B as the 4-channel models and every other model
-        # as 2-channel, so "24..." means four channels and anything else two.
+        # ASSUMPTION(hw) Q21: the variant string format is not in the manual (PG §3.17 example
+        # "2206"), nor is the channel count of a model (PG §3.17 returns only the string). The
+        # fake treats "24..." (2405A..2408B) as four channels and anything else as two.
         return 4 if self.variant.startswith("24") else 2
 
     @staticmethod
@@ -369,6 +417,8 @@ class FakePs2000a:
             return (_INVALID_HANDLE, "")
         if info not in _INFO_NAMES:
             return (STATUS["PICO_INVALID_INFO"], "")  # PG §3.17 Returns
+        if info in self.info_unavailable:
+            return (STATUS["PICO_INFO_UNAVAILABLE"], "")  # PG §3.17 Returns
         if info == "PICO_VARIANT_INFO":
             return (_OK, unit.variant)
         if info == "PICO_BATCH_AND_SERIAL":
@@ -433,6 +483,9 @@ class FakePs2000a:
         unit.channels[channel] = ChannelConfig(
             enabled=bool(enabled), coupling=type, range=range, analog_offset=float(analogOffset)
         )
+        # PG §2.6.1 "Data retention": the data is lost when the settings are changed.
+        # ASSUMPTION(hw) Q35: that includes channel settings changed after RunBlock.
+        unit.data_valid = False
         return (_OK,)
 
     def ps2000aGetTimebase2(
@@ -495,9 +548,10 @@ class FakePs2000a:
         if unit is None:
             return (_INVALID_HANDLE,)  # PG §3.56 Returns
         if not enable:
-            # PG §3.56: zero disables the trigger. ASSUMPTION(hw): the other arguments are
+            # PG §3.56: zero disables the trigger. ASSUMPTION(hw) Q29: the other arguments are
             # ignored when enable is 0.
             unit.trigger = TriggerConfig()
+            unit.data_valid = False  # PG §2.6.1 "Data retention", ASSUMPTION(hw) Q35
             return (_OK,)
         status = self._channel_status(unit, source)
         if status != _OK:
@@ -527,6 +581,7 @@ class FakePs2000a:
             delay=int(delay),
             auto_trigger_ms=int(autoTrigger_ms),
         )
+        unit.data_valid = False  # PG §2.6.1 "Data retention", ASSUMPTION(hw) Q35
         return (_OK,)
 
     def ps2000aSetDataBuffer(
@@ -556,10 +611,11 @@ class FakePs2000a:
             # Fake limitation (phase 1 is raw data only). PG §3.40: SetDataBuffer does not
             # support aggregation (use SetDataBuffers); downsampling is not simulated.
             return (STATUS["PICO_RATIO_MODE_NOT_SUPPORTED"],)
-        # PG §3.40: tells the driver where to store the data. The array is kept by reference
-        # and written in place by GetValues. ASSUMPTION(hw): a buffer survives later
+        # PG §3.40: tells the driver where to store the data. The array is kept by weak
+        # reference and written in place by GetValues; if the caller lets it die, GetValues
+        # fails (the driver's pointer would dangle). ASSUMPTION(hw) Q18: a buffer survives later
         # SetChannel and RunBlock calls (PG §2.6.1.1 step 7: "outside the loop").
-        unit.buffers[channel] = buffer
+        unit.buffers[channel] = weakref.ref(buffer)
         return (_OK,)
 
     # -- run, wait, retrieve, stop ----------------------------------------------------------
@@ -607,9 +663,9 @@ class FakePs2000a:
         if pre + post > max_samples:
             # PG §3.37: the total must not exceed the segment size.
             return (STATUS["PICO_TOO_MANY_SAMPLES"], 0)
-        # A new run discards the previous data (PG §2.6.1 "Data retention"). Channel settings
-        # are snapshotted: ASSUMPTION(hw) a later SetChannel does not alter this capture
-        # (PG §2.6.1 says only that "the data is lost when the settings are changed").
+        # A new run discards the previous data (PG §2.6.1 "Data retention"). The channel
+        # settings are snapshotted for generating the data; a later SetChannel or
+        # SetSimpleTrigger makes the data invalid anyway (`data_valid`, ASSUMPTION(hw) Q18).
         unit.armed = True
         unit.has_run = True
         unit.polls_left = self.ready_after
@@ -618,31 +674,60 @@ class FakePs2000a:
             name: ChannelConfig(c.enabled, c.coupling, c.range, c.analog_offset)
             for name, c in unit.channels.items()
         }
-        unit.phase = self._trigger_phase(unit)
+        unit.phase, unit.never_ready = self._trigger_plan(unit)
+        unit.data_valid = True
         # PG §3.37: timeIndisposedMs is the time spent collecting, without any auto trigger
         # timeout. Rounded before ceil so float noise cannot add a millisecond.
         time_ms = math.ceil(round((pre + post) * interval_ns / 1e6, 9))
         return (_OK, time_ms)
 
-    def _trigger_phase(self, unit: FakeUnit) -> float:
-        """Clock phase (cycles) that puts the trigger edge at sample index `pre`.
+    def _amplitude(self, channel: str) -> float:
+        """Clock amplitude in volts on `channel` (`clock_v` times its `per_channel_scale`)."""
+        return self.clock_v * self.per_channel_scale.get(channel, 1.0)
+
+    def _span(self, amplitude: float) -> tuple[float, float]:
+        """Lowest and highest volts the generated signal reaches, defects included."""
+        low = 0.0
+        high = amplitude * 999 / 1000 if self.signal == "ramp" else amplitude
+        if self.defect == "shift":
+            low, high = low + 0.1 * amplitude, high + 0.1 * amplitude
+        elif self.defect == "gain":
+            high *= 1.1
+        return low, high
+
+    def _trigger_plan(self, unit: FakeUnit) -> tuple[float, bool]:
+        """(clock phase in cycles, never_ready) that the trigger settings give at RunBlock.
 
         PG §3.56 gives a direction and a threshold but not where the trigger sample sits;
-        ASSUMPTION(hw): it is sample index `pre` (PG §3.37 only says pre + post samples are
+        ASSUMPTION(hw) Q30: it is sample index `pre` (PG §3.37 only says pre + post samples are
         returned). With RISING (also ABOVE, RISING_OR_FALLING) the first sample at or above the
-        threshold after being below it is index `pre`; FALLING (also BELOW) is the mirror
-        image. A threshold the clock never crosses behaves as an auto-trigger timeout: phase 0
-        (ASSUMPTION(hw), PG §3.56 `autoTrigger_ms` semantics are open).
+        threshold after being below it is index `pre`: phase 0; FALLING (also BELOW) is the
+        mirror image: phase 0.5. The threshold is honoured, in ADC codes of the source channel:
+        an edge exists only if the signal has samples below and at-or-above it. When no edge
+        exists the trigger cannot fire: with `auto_trigger_ms == 0` the capture never becomes
+        ready (PG §3.56: "wait indefinitely"), otherwise the phase is arbitrary (0.37, fixed
+        so that tests are deterministic). A level condition that is already true (ABOVE with the
+        signal always above, BELOW with it always below) fires at once, also at phase 0.37.
+        ASSUMPTION(hw) Q11: what a real unit captures after an auto-trigger timeout is open.
         """
         trigger = unit.trigger
         if not trigger.enabled:
-            return 0.0  # SPEC §6: without a trigger the phase is fixed at 0
+            return 0.0, False  # SPEC §6: without a trigger the phase is fixed at 0
         range_v = RANGE_VOLTS[unit.channels[trigger.source].range]
-        level_v = trigger.threshold / MAX_ADC * range_v  # PG §2.3 scaling
-        if trigger.direction in ("PS2000A_FALLING", "PS2000A_BELOW"):
-            if 0.0 <= level_v < self.clock_v:
-                return 0.5
-        return 0.0
+        low_v, high_v = self._span(self._amplitude(trigger.source))
+        low = int(np.clip(round(low_v / range_v * MAX_ADC), MIN_ADC, MAX_ADC))  # PG §2.3
+        high = int(np.clip(round(high_v / range_v * MAX_ADC), MIN_ADC, MAX_ADC))
+        threshold = trigger.threshold
+        falling = trigger.direction in ("PS2000A_FALLING", "PS2000A_BELOW")
+        if low < threshold <= high:  # samples below and at-or-above: an edge exists
+            return (0.5 if falling else 0.0), False
+        if trigger.direction == "PS2000A_ABOVE" and threshold <= low:
+            return _ARBITRARY_PHASE, False  # always above: fires at once
+        if trigger.direction == "PS2000A_BELOW" and threshold > high:
+            return _ARBITRARY_PHASE, False  # always below: fires at once
+        if trigger.auto_trigger_ms == 0:
+            return 0.0, True  # PG §3.56: waits indefinitely for a trigger that cannot come
+        return _ARBITRARY_PHASE, False  # auto trigger timeout: arbitrary but deterministic
 
     def ps2000aIsReady(self, handle: int) -> tuple[int, int]:
         rejected = self._begin("ps2000aIsReady", handle)
@@ -655,6 +740,8 @@ class FakePs2000a:
             # ASSUMPTION(hw): with nothing running the call returns (PICO_OK, 0); PG §3.26
             # does not say (it lists PICO_NO_SAMPLES_AVAILABLE and PICO_CANCELLED unexplained).
             return (_OK, 0)
+        if unit.never_ready:
+            return (_OK, 0)  # PG §3.56: still waiting for a trigger that cannot come
         if unit.polls_left > 0:
             unit.polls_left -= 1  # PG §3.26: zero while the device is still collecting
             return (_OK, 0)
@@ -691,8 +778,9 @@ class FakePs2000a:
             # Fake limitation: no downsampling (phase 1). PG §3.18 lists the code.
             return (STATUS["PICO_RATIO_MODE_NOT_SUPPORTED"], 0, 0)
         # PG §3.18: RATIO_MODE_NONE ignores downSampleRatio.
-        if not unit.has_run or unit.polls_left > 0:
-            # PG §3.18: before the scope is ready "no capture will be available".
+        if not unit.has_run or unit.polls_left > 0 or unit.never_ready or not unit.data_valid:
+            # PG §3.18: before the scope is ready "no capture will be available"; PG §2.6.1
+            # "Data retention": the data is gone once the settings were changed (Q18).
             return (STATUS["PICO_NO_SAMPLES_AVAILABLE"], 0, 0)
         total = unit.pre + unit.post
         if startIndex < 0 or noOfSamples < 0:
@@ -702,25 +790,39 @@ class FakePs2000a:
         # PG §3.18: the number retrieved is not more than requested; the data starts at
         # startIndex (measured in sample intervals from the start of the buffer).
         n = min(noOfSamples, total - startIndex)
+        if self.short_read is not None:
+            n = min(n, self.short_read)  # knob: the driver returns fewer samples than asked
+        for registered in unit.buffers.values():
+            if registered() is None:
+                # The caller let a registered array die: the driver's pointer would dangle.
+                # ASSUMPTION(hw) Q33: the driver may touch the buffer of any registered
+                # channel, enabled or not, so a dead array anywhere is an error.
+                return (_INVALID_PARAMETER, 0, 0)
         targets: list[tuple[str, npt.NDArray[np.int16]]] = []
         for name, config in unit.run_channels.items():
-            # PG §3.18: one call serves all enabled channels. ASSUMPTION(hw): an enabled
+            # PG §3.18: one call serves all enabled channels. ASSUMPTION(hw) Q6: an enabled
             # channel without a buffer, and a buffer of a disabled channel, are left alone
             # (the manual lists PICO_BUFFERS_NOT_SET without explanation).
-            buffer = unit.buffers.get(name)
+            ref = unit.buffers.get(name)
+            buffer = None if ref is None else ref()
             if not config.enabled or buffer is None:
                 continue
             if len(buffer) < n:
-                # ASSUMPTION(hw): a buffer shorter than the returned samples gives
+                # ASSUMPTION(hw) Q19: a buffer shorter than the returned samples gives
                 # PICO_INVALID_PARAMETER; PG §3.40 does not say what happens.
                 return (_INVALID_PARAMETER, 0, 0)
             targets.append((name, buffer))
-        volts = self._signal(total, unit.pre, self._interval_s(unit.timebase), unit.phase)
+        interval_s = self._interval_s(unit.timebase)
+        step = 2 ** (16 - self.adc_bits)  # codes are multiples of this (adc_bits knob)
         overflow = 0
         for name, buffer in targets:
             range_v = RANGE_VOLTS[unit.run_channels[name].range]
+            volts = self._signal(total, unit.pre, interval_s, unit.phase, self._amplitude(name))
             # PG §2.3: count = volts / range * 32 512, clipped to the ADC limits.
-            counts = np.rint(volts / range_v * MAX_ADC).astype(np.int64)
+            codes = volts / range_v * MAX_ADC
+            if self.noise_codes > 0:
+                codes = codes + self._rng.normal(0.0, self.noise_codes, size=total)
+            counts = np.rint(np.rint(codes / step) * step).astype(np.int64)
             counts_out = counts[startIndex : startIndex + n]
             if np.any((counts_out > MAX_ADC) | (counts_out < MIN_ADC)):
                 overflow |= 1 << CHANNELS[name]  # PG §3.18: bit 0 = channel A
@@ -745,6 +847,23 @@ class FakePs2000a:
         unit.armed = False
         return (_OK,)
 
+    def ps2000aMemorySegments(self, handle: int, nSegments: int) -> tuple[int, int]:
+        rejected = self._begin("ps2000aMemorySegments", handle, nSegments)
+        if rejected is not None:
+            return (rejected, 0)
+        if handle not in self.units:
+            return (_INVALID_HANDLE, 0)  # PG §3.29 Returns
+        if nSegments < 1:
+            return (_INVALID_PARAMETER, 0)  # PG §3.29: "Minimum: 1"
+        if nSegments > 1:
+            # Fake limitation: phase 1 uses one segment. PG §3.29 lists PICO_TOO_MANY_SEGMENTS.
+            return (STATUS["PICO_TOO_MANY_SEGMENTS"], 0)
+        # PG §3.29: nMaxSamples is the number of samples in each segment, the total over all
+        # channels (divide by 2 for two channels, by 4 for three or four). One segment is the
+        # state after ps2000aOpenUnit, so nothing changes. ASSUMPTION(hw) Q31: it equals
+        # `memory_samples`, which is also what the fake gives GetTimebase2 for one channel.
+        return (_OK, self.memory_samples)
+
     # -- signal generation ------------------------------------------------------------------
 
     def _interval_s(self, timebase: int) -> float:
@@ -753,21 +872,21 @@ class FakePs2000a:
         return interval_ns * 1e-9
 
     def _signal(
-        self, total: int, pre: int, interval_s: float, phase: float
+        self, total: int, pre: int, interval_s: float, phase: float, amplitude: float
     ) -> npt.NDArray[np.float64]:
         """Volts at the input for sample indices 0..total-1 (before ADC conversion)."""
         index = np.arange(total)
         if self.signal == "ramp":
-            volts = index % 1000 / 1000 * self.clock_v
+            volts = index % 1000 / 1000 * amplitude
         else:
             # Square wave between 0 and clock_v. The time axis is (i - pre) * interval, so a
             # 1 kHz clock sampled at 1 us has a period of 1000 samples. phase 0 puts a rising
             # edge exactly at index `pre`, phase 0.5 a falling edge.
             cycles = (index - pre) * interval_s * self.clock_hz + phase
             fraction = (cycles + _CLOCK_EDGE_TOLERANCE) % 1.0
-            volts = np.where(fraction < 0.5, self.clock_v, 0.0)
+            volts = np.where(fraction < 0.5, amplitude, 0.0)
         if self.defect == "shift":
-            volts = volts + 0.1 * self.clock_v  # DC offset error
+            volts = volts + 0.1 * amplitude  # DC offset error
         elif self.defect == "gain":
             volts = volts * 1.1  # gain error
         return np.asarray(volts, dtype=np.float64)

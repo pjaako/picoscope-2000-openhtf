@@ -3,6 +3,8 @@
 """
 
 import logging
+import subprocess
+import sys
 from collections.abc import Iterator
 from typing import Any
 
@@ -80,22 +82,27 @@ def _plug(
     return plug, fake
 
 
+class _AnyId:
+    """Equal to any integer: the fake logs a buffer as `("ndarray", id, len)`."""
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, int)
+
+    def __hash__(self) -> int:
+        return 0
+
+    def __repr__(self) -> str:
+        return "<any id>"
+
+
 def _calls(fake: FakePs2000a) -> list[tuple[str, tuple[object, ...]]]:
-    """The fake's log with numpy buffers replaced by `("buffer", dtype, size)`."""
-    return [
-        (
-            name,
-            tuple(
-                ("buffer", str(a.dtype), a.size) if isinstance(a, np.ndarray) else a for a in args
-            ),
-        )
-        for name, args in fake.log
-    ]
+    """The fake's log (buffers are already logged as `("ndarray", id, len)`)."""
+    return list(fake.log)
 
 
-def _buffer(size: int) -> tuple[str, str, int]:
-    """How `_calls` shows an int16 buffer of `size` samples."""
-    return ("buffer", "int16", size)
+def _buffer(size: int) -> tuple[str, _AnyId, int]:
+    """How the fake logs an int16 buffer of `size` samples."""
+    return ("ndarray", _AnyId(), size)
 
 
 def _names(fake: FakePs2000a) -> list[str]:
@@ -134,6 +141,37 @@ def test_package_exports_resolve() -> None:
     assert issubclass(ClippedError, ValueError)
     with pytest.raises(AttributeError):
         package.nope  # noqa: B018
+
+
+def test_pico_error_survives_copy_and_pickle() -> None:
+    import copy
+    import pickle
+
+    error = PicoError("ps2000aRunBlock", STATUS["PICO_BUSY"], "PICO_BUSY", "while armed")
+    assert str(error) == "ps2000aRunBlock returned PICO_BUSY (0x00000027): while armed"
+    for clone in (copy.copy(error), copy.deepcopy(error), pickle.loads(pickle.dumps(error))):
+        assert isinstance(clone, PicoError)
+        assert (clone.function, clone.status, clone.name, clone.detail) == (
+            "ps2000aRunBlock",
+            STATUS["PICO_BUSY"],
+            "PICO_BUSY",
+            "while armed",
+        )
+        assert str(clone) == str(error)
+    assert str(PicoError("f", 0x2A, "X")) == "f returned X (0x0000002A)"
+
+
+def test_conf_declaration_survives_a_module_reload() -> None:
+    # in a subprocess: a reload here would replace PicoError & co. for the other tests
+    code = (
+        "import importlib\n"
+        "import picoscope_2000_openhtf.plug as plug\n"
+        "plug = importlib.reload(plug)\n"  # must not raise KeyAlreadyDeclaredError
+        "print(plug.CONF.picoscope_2000_timeout_s, plug.CONF.picoscope_2000_serial)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["10.0", "None"]
 
 
 # -- construction -----------------------------------------------------------------------------
@@ -203,31 +241,90 @@ def test_ok_status_with_unusable_handle_is_not_found(handle: int) -> None:
     assert "ps2000aCloseUnit" not in _names(fake)
 
 
-def test_enumerate_failure_raises_before_opening() -> None:
-    fake = FakePs2000a()
+@pytest.mark.parametrize("serial", [None, "FAKE0/001"])
+def test_enumerate_failure_is_a_warning_and_the_unit_still_opens(
+    serial: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    # SPEC §4: enumeration is informational, an opening by serial does not depend on it
+    fake = FakePs2000a(serials=("FAKE0/001", "FAKE0/002"))
     fake.reject["ps2000aEnumerateUnits"] = "PICO_BUSY"
+    with caplog.at_level(logging.INFO):
+        plug = PicoScope2000Plug(serial, api=fake)
+    assert plug.serial == "FAKE0/001"
+    assert _names(fake)[:2] == ["ps2000aEnumerateUnits", "ps2000aOpenUnit"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        "ps2000aEnumerateUnits returned PICO_BUSY; continuing without the unit list"
+    ]
+
+
+@pytest.mark.parametrize("handle", [1, 7])
+def test_open_unit_error_with_a_positive_handle_closes_that_handle(handle: int) -> None:
+    class _OpensAndFails(FakePs2000a):
+        def ps2000aOpenUnit(self, serial: str | None) -> tuple[int, int]:
+            status, opened = super().ps2000aOpenUnit(serial)
+            assert status == STATUS["PICO_OK"]
+            return (STATUS["PICO_BUSY"], handle if handle != 1 else opened)
+
+    fake = _OpensAndFails()
     with pytest.raises(PicoError) as excinfo:
         PicoScope2000Plug(api=fake)
-    assert excinfo.value.function == "ps2000aEnumerateUnits"
-    assert _names(fake) == ["ps2000aEnumerateUnits"]
+    assert excinfo.value.function == "ps2000aOpenUnit"
+    assert excinfo.value.name == "PICO_BUSY"
+    assert fake.log[-1] == ("ps2000aCloseUnit", (handle,))  # PG §3.2: the unit is not leaked
+    assert "ps2000aGetUnitInfo" not in _names(fake)
+    if handle == 1:
+        assert fake.closed_handles == [1] and fake.units == {}
 
 
-def test_info_unavailable_is_stored_as_empty_string() -> None:
+def test_open_unit_error_with_no_handle_closes_nothing() -> None:
     fake = FakePs2000a()
-    fake.reject["ps2000aGetUnitInfo"] = "PICO_INFO_UNAVAILABLE"  # PG §3.17 Returns
-    plug = PicoScope2000Plug(api=fake)
+    fake.reject["ps2000aOpenUnit"] = "PICO_BUSY"  # the fake answers (status, 0)
+    with pytest.raises(PicoError, match="PICO_BUSY"):
+        PicoScope2000Plug(api=fake)
+    assert "ps2000aCloseUnit" not in _names(fake)
+
+
+@pytest.mark.parametrize("status", ["PICO_INFO_UNAVAILABLE", "PICO_INVALID_INFO"])  # PG §3.17
+def test_missing_info_is_stored_as_empty_string_with_a_warning(
+    status: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = FakePs2000a()
+    fake.reject["ps2000aGetUnitInfo"] = status
+    with caplog.at_level(logging.INFO):
+        plug = PicoScope2000Plug(api=fake)
     assert len(plug.info) == 11
     assert set(plug.info.values()) == {""}
     assert plug.serial == ""
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 11
+    assert warnings[0] == f"PICO_DRIVER_VERSION: ps2000aGetUnitInfo returned {status}"
+
+
+def test_one_missing_info_code_still_opens() -> None:
+    fake = FakePs2000a()
+    original = fake.ps2000aGetUnitInfo
+
+    def one_invalid(handle: int, info: str) -> tuple[int, str]:
+        if info == "PICO_CAL_DATE":
+            fake.log.append(("ps2000aGetUnitInfo", (handle, info)))
+            return (STATUS["PICO_INVALID_INFO"], "")
+        return original(handle, info)
+
+    fake.ps2000aGetUnitInfo = one_invalid  # type: ignore[method-assign]
+    plug = PicoScope2000Plug(api=fake)
+    assert plug.info["PICO_CAL_DATE"] == ""
+    assert plug.serial == "FAKE0/001"
+    assert plug.max_adc == 32512
 
 
 def test_other_info_error_raises_and_closes_the_unit() -> None:
     fake = FakePs2000a()
-    fake.reject["ps2000aGetUnitInfo"] = "PICO_INVALID_INFO"
+    fake.reject["ps2000aGetUnitInfo"] = "PICO_NOT_RESPONDING"
     with pytest.raises(PicoError) as excinfo:
         PicoScope2000Plug(api=fake)
     assert excinfo.value.function == "ps2000aGetUnitInfo"
-    assert excinfo.value.name == "PICO_INVALID_INFO"
+    assert excinfo.value.name == "PICO_NOT_RESPONDING"
     assert fake.log[-1] == ("ps2000aCloseUnit", (1,))
     assert fake.closed_handles == [1]
 
@@ -317,12 +414,12 @@ def test_timeout_precedence_argument_then_conf_then_default() -> None:
         return str(excinfo.value)
 
     plug, fake = _plug()
-    assert timeout_message(plug, fake) == "no trigger within 10 s"
+    assert timeout_message(plug, fake) == "capture not ready within 10.005 s"  # + 5 ms
     CONF.load(picoscope_2000_timeout_s=3.0)
     plug, fake = _plug()
-    assert timeout_message(plug, fake) == "no trigger within 3 s"
+    assert timeout_message(plug, fake) == "capture not ready within 3.005 s"
     plug, fake = _plug(timeout_s=2.5)
-    assert timeout_message(plug, fake) == "no trigger within 2.5 s"
+    assert timeout_message(plug, fake) == "capture not ready within 2.505 s"
 
 
 # -- list_units -------------------------------------------------------------------------------
@@ -360,8 +457,7 @@ def test_apply_capture_log_sequence_two_channel_unit() -> None:
         (
             "ps2000aSetChannel",
             (1, C, 0, "PS2000A_DC", "PS2000A_1V", 0.0),
-        ),  # tolerated, open question 21
-        ("ps2000aSetChannel", (1, D, 0, "PS2000A_DC", "PS2000A_1V", 0.0)),
+        ),  # refused, tolerated: two-channel unit (open questions 21, 33); D is skipped
         ("ps2000aGetTimebase2", (1, 127, 2000, 0, 0)),  # PG §2.7: (127 - 2) / 125 MS/s = 1 us
         ("ps2000aGetTimebase2", (1, 126, 2000, 0, 0)),  # 0.992 us: too short, 127 it is
         ("ps2000aSetSimpleTrigger", (1, 1, A, 8128, "PS2000A_RISING", 0, 1000)),  # 0.5 / 2 * 32512
@@ -378,16 +474,58 @@ def test_apply_capture_log_sequence_two_channel_unit() -> None:
 def test_apply_capture_registers_zeroed_buffers_in_place() -> None:
     plug, fake = _plug()
     plug.apply_capture(CAPTURE)
-    registered = [
-        a
-        for name, args in fake.log
-        if name == "ps2000aSetDataBuffer"
-        for a in args
-        if isinstance(a, np.ndarray)
-    ]
-    assert [len(b) for b in registered] == [2000, 2000]
-    assert all(b.dtype == np.int16 and not b.any() for b in registered)
+    registered = [ref() for ref in fake.units[1].buffers.values()]
+    assert all(b is not None for b in registered)
+    assert [len(b) for b in registered if b is not None] == [2000, 2000]
+    assert all(b.dtype == np.int16 and not b.any() for b in registered if b is not None)
     assert registered[0] is not registered[1]
+
+
+def _live_buffers(fake: FakePs2000a) -> dict[str, bool]:
+    """Channel name -> is the array the driver was given still alive (weak references)."""
+    return {name: ref() is not None for name, ref in fake.units[1].buffers.items()}
+
+
+def test_buffers_stay_alive_when_a_later_capture_enables_fewer_channels() -> None:
+    # B1: the driver keeps the raw pointer (PG §3.40); channel B's array must not be freed
+    plug, fake = _plug()
+    plug.apply_capture(CAPTURE)
+    assert _live_buffers(fake) == {A: True, B: True}
+    plug.apply_capture(_single_channel())
+    assert _live_buffers(fake) == {A: True, B: True}
+    plug.single()
+    plug.wait_ready()
+    assert len(plug.read_waveform(1).raw) == 5000  # GetValues did not see a dangling pointer
+    plug.apply_capture(CAPTURE)
+    _acquire(plug)
+    assert len(plug.read_waveform(2).raw) == 2000
+    assert _live_buffers(fake) == {A: True, B: True}
+
+
+def test_buffers_stay_alive_after_a_partial_set_data_buffer_failure() -> None:
+    class _FailsForB(FakePs2000a):
+        reject_b = False
+
+        def ps2000aSetDataBuffer(self, handle: int, channel: str, *args: Any) -> tuple[int]:
+            if channel == B and self.reject_b:  # refused: the registration stays as it was
+                return (STATUS["PICO_INVALID_PARAMETER"],)
+            return super().ps2000aSetDataBuffer(handle, channel, *args)
+
+    fake = _FailsForB()
+    plug = PicoScope2000Plug(api=fake)
+    plug.apply_capture(CAPTURE)
+    old_a = fake.units[1].buffers[A]()
+    fake.reject_b = True
+    with pytest.raises(PicoError, match="ps2000aSetDataBuffer"):
+        plug.apply_capture(CAPTURE)
+    # the traceback of the exception held the failed call's frame; look only afterwards
+    assert plug.capture is None
+    new_a = fake.units[1].buffers[A]()
+    assert new_a is not None and new_a is not old_a  # A's new array was registered ...
+    assert _live_buffers(fake) == {A: True, B: True}  # ... and nothing the driver knows died
+    fake.reject_b = False
+    _acquire(plug)
+    assert len(plug.read_waveform(2).raw) == 2000
 
 
 def test_apply_capture_trigger_options_and_no_trigger() -> None:
@@ -397,12 +535,12 @@ def test_apply_capture_trigger_options_and_no_trigger() -> None:
         sample_interval=1 * us,
         pre_samples=10,
         post_samples=90,
-        trigger=Edge(source=2, level=-0.25, direction="FALLING", auto_ms=0, delay_samples=5),
+        trigger=Edge(source=2, level=-0.25, direction="FALLING", auto_ms=0),
     )
     plug.apply_capture(capture)
     calls = _calls(fake)
     assert ("ps2000aSetChannel", (1, B, 1, "PS2000A_AC", "PS2000A_500MV", 0.0)) in calls
-    assert ("ps2000aSetSimpleTrigger", (1, 1, B, -16256, "PS2000A_FALLING", 5, 0)) in calls
+    assert ("ps2000aSetSimpleTrigger", (1, 1, B, -16256, "PS2000A_FALLING", 0, 0)) in calls
     fake.log.clear()
     plug.apply_capture(
         Capture(
@@ -432,7 +570,42 @@ def test_two_channel_unit_by_default_and_all_four_channels_are_sent() -> None:
     assert plug.channel_count == 4  # until the unit says otherwise
     plug.apply_capture(CAPTURE)
     assert plug.channel_count == 2
-    assert [args[1] for name, args in fake.log if name == "ps2000aSetChannel"] == [A, B, C, D]
+    # C is refused while being disabled: the unit has two channels, D is not even tried
+    assert [args[1] for name, args in fake.log if name == "ps2000aSetChannel"] == [A, B, C]
+    fake.log.clear()
+    plug.apply_capture(CAPTURE)  # later captures skip C and D altogether
+    assert [args[1] for name, args in fake.log if name == "ps2000aSetChannel"] == [A, B]
+
+
+def test_a_disabled_channel_c_refused_with_any_status_means_two_channels(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _RefusesCD(FakePs2000a):
+        def ps2000aSetChannel(self, handle: int, channel: str, *args: Any) -> tuple[int]:
+            if channel in (C, D):
+                self.log.append(("ps2000aSetChannel", (handle, channel, *args)))
+                return (STATUS["PICO_INVALID_VOLTAGE_RANGE"],)
+            return super().ps2000aSetChannel(handle, channel, *args)
+
+    fake = _RefusesCD()
+    plug = PicoScope2000Plug(api=fake)
+    with caplog.at_level(logging.INFO):
+        plug.apply_capture(CAPTURE)
+    assert plug.channel_count == 2
+    assert any(
+        "PICO_INVALID_VOLTAGE_RANGE while disabling it" in r.getMessage()
+        and r.levelno == logging.INFO
+        for r in caplog.records
+    )
+    # an enabled channel the unit refuses is still an error
+    capture = Capture(
+        channels=(Channel(ch=1, range=2 * V), Channel(ch=3, range=2 * V)),
+        sample_interval=1 * us,
+        pre_samples=0,
+        post_samples=100,
+    )
+    with pytest.raises(PicoError, match="PICO_INVALID_VOLTAGE_RANGE"):
+        plug.apply_capture(capture)
 
 
 def test_enabled_channel_the_unit_does_not_have_raises() -> None:
@@ -525,32 +698,129 @@ def test_timebase_zero_is_used_with_one_channel() -> None:
     assert plug.sample_interval_s == pytest.approx(1e-9, rel=1e-6)
 
 
-def test_timebase_search_walks_down_on_a_500_ms_model() -> None:
-    plug, fake = _plug(max_rate_hz=5e8)  # PG §2.7: (n - 2) / 62.5 MS/s, 16 ns per step
-    plug.apply_capture(_single_channel(interval=0.5 * us, pre=10, post=90))
-    searched = [args[1] for name, args in fake.log if name == "ps2000aGetTimebase2"]
-    assert searched == list(range(64, 32, -1))  # 64 .. 33, stops at 33: 31 * 16 ns < 500 ns
-    assert plug.timebase == 34
-    assert plug.sample_interval_s == pytest.approx(512e-9, rel=1e-6)
+def _probes(fake: FakePs2000a) -> list[int]:
+    return [args[1] for name, args in fake.log if name == "ps2000aGetTimebase2"]  # type: ignore[misc]
 
 
-def test_timebase_search_is_capped_at_64_calls() -> None:
-    plug, fake = _plug(max_rate_hz=5e8)  # estimate 252, answer 127: 125 steps down
-    with pytest.raises(CaptureError, match="64 ps2000aGetTimebase2 calls"):
+@pytest.mark.parametrize(
+    ("max_rate_hz", "interval"),
+    [
+        (5e8, 2 * us),  # PG §2.7, 500 MS/s table: the 1 GS/s estimate is 2x too far
+        (5e8, 10 * us),
+        (5e8, 1e-3),
+        (5e8, 5e-9),  # n = 2 (8 ns) is the first one long enough, below the linear part
+        (5e8, 3e-9),  # n = 1 (4 ns)
+        (1e9, 0.5),  # C float steps of 32 ns near 0.5 s
+        (1e9, 30.0),  # n = 3 750 000 002; the C float of PG §3.14 has steps of 2 us there
+    ],
+)
+def test_timebase_search_finds_the_smallest_long_enough_interval_in_few_calls(
+    max_rate_hz: float, interval: float
+) -> None:
+    plug, fake = _plug(max_rate_hz=max_rate_hz)
+    plug.apply_capture(_single_channel(interval=interval, pre=10, post=90))
+    probes = _probes(fake)
+    assert len(probes) <= 1 + 8  # the first (valid) probe plus at most 8 more, SPEC §4 step 2
+    assert len(probes) == len(set(probes))  # nothing is probed twice
+    assert plug.sample_interval_s is not None and plug.timebase is not None
+    # never shorter than requested, up to the rounding of the driver's C float (PG §3.14)
+    assert plug.sample_interval_s >= interval * (1 - 1e-6)
+    if interval < 10:
+        assert plug.sample_interval_s >= interval  # exactly representable: strictly
+    if plug.timebase > 0:  # and the next shorter timebase is really too short
+        shorter = fake.ps2000aGetTimebase2(1, plug.timebase - 1, 100, 0, 0)
+        assert shorter[0] == STATUS["PICO_OK"]
+        assert shorter[1] * 1e-9 < interval * (1 if interval < 10 else 1 + 1e-6)
+
+
+def test_timebase_search_on_a_500_ms_model_log_sequence() -> None:
+    plug, fake = _plug(max_rate_hz=5e8)  # (n - 2) / 62.5 MS/s: 16 ns per step
+    plug.apply_capture(_single_channel(interval=2 * us, pre=10, post=90))
+    # estimate 252 (4 us), re-estimate 2 + ceil(250 * 2 / 4) = 127 (2 us), 126 is too short
+    assert _probes(fake) == [252, 127, 126]
+    assert plug.timebase == 127
+    assert plug.sample_interval_s == pytest.approx(2e-6, rel=1e-6)
+
+
+def test_timebase_search_gives_up_after_eight_probes_past_the_first_valid_one() -> None:
+    class _Flat(FakePs2000a):  # a driver whose interval never grows: nothing is long enough
+        def _interval_ns(self, timebase: int) -> float | None:
+            return 1000.0 if timebase >= 0 else None
+
+    plug = PicoScope2000Plug(api=(fake := _Flat()))
+    with pytest.raises(CaptureError, match="8 ps2000aGetTimebase2 calls after the first valid"):
         plug.apply_capture(_single_channel(interval=2 * us, pre=10, post=90))
-    assert _names(fake).count("ps2000aGetTimebase2") == 64
+    assert len(_probes(fake)) == 1 + 8
     assert "ps2000aSetSimpleTrigger" not in _names(fake)
 
 
-def test_timebase_error_after_the_estimate_raises() -> None:
+def test_timebase_beyond_the_slowest_one_is_a_capture_error() -> None:
     plug, fake = _plug()
-    fake.reject["ps2000aGetTimebase2"] = "PICO_INVALID_HANDLE"
+    with pytest.raises(CaptureError, match="longer than the slowest timebase 4294967295"):
+        plug.apply_capture(_single_channel(interval=100.0, pre=10, post=90))  # max is 34.4 s
+    assert _probes(fake) == [2**32 - 1]  # the estimate is clamped to PG §3.37's range
+
+
+def test_timebase_search_rejects_a_zero_interval() -> None:
+    class _Zero(FakePs2000a):
+        def ps2000aGetTimebase2(self, *args: Any) -> tuple[int, float, int]:
+            status, _, max_samples = super().ps2000aGetTimebase2(*args)
+            return (status, 0.0, max_samples)
+
+    plug = PicoScope2000Plug(api=_Zero())
+    with pytest.raises(CaptureError, match="sample interval of 0 s"):
+        plug.apply_capture(_single_channel())
+
+
+def test_timebase_error_at_the_estimate_raises_the_original_status() -> None:
+    plug, fake = _plug()
+    fake.reject["ps2000aGetTimebase2"] = "PICO_NOT_RESPONDING"
     with pytest.raises(PicoError) as excinfo:
         plug.apply_capture(_single_channel())
     assert excinfo.value.function == "ps2000aGetTimebase2"
-    assert excinfo.value.name == "PICO_INVALID_HANDLE"
-    searched = [args[1] for name, args in fake.log if name == "ps2000aGetTimebase2"]
-    assert searched == [127, 128]  # the estimate is tolerated once, the next failure raises
+    assert excinfo.value.name == "PICO_NOT_RESPONDING"
+    assert _probes(fake) == [127]  # a refusal above n = 3 is not tolerated
+
+
+def test_timebase_error_after_the_first_valid_probe_raises() -> None:
+    class _FailsAfterFirst(FakePs2000a):
+        def ps2000aGetTimebase2(self, *args: Any) -> tuple[int, float, int]:
+            status, interval, max_samples = super().ps2000aGetTimebase2(*args)
+            if args[1] != 252:  # every probe but the first (the estimate)
+                return (STATUS["PICO_NOT_RESPONDING"], 0.0, 0)
+            return (status, interval, max_samples)
+
+    plug = PicoScope2000Plug(api=_FailsAfterFirst(max_rate_hz=5e8))
+    with pytest.raises(PicoError) as excinfo:
+        plug.apply_capture(_single_channel(interval=2 * us, pre=10, post=90))
+    assert excinfo.value.name == "PICO_NOT_RESPONDING"
+
+
+def test_timebase_refusal_below_n3_is_skipped_but_not_above() -> None:
+    class _RefusesN2(FakePs2000a):
+        def ps2000aGetTimebase2(self, *args: Any) -> tuple[int, float, int]:
+            if args[1] == 2:
+                self.log.append(("ps2000aGetTimebase2", args))
+                return (STATUS["PICO_NOT_RESPONDING"], 0.0, 0)
+            return super().ps2000aGetTimebase2(*args)
+
+    fake = _RefusesN2()
+    plug = PicoScope2000Plug(api=fake)
+    plug.apply_capture(_single_channel(interval=4e-9, pre=10, post=90))  # estimate n = 2
+    assert plug.timebase == 3  # n = 2 was refused: tolerated at the estimate, up to n = 3
+    assert plug.sample_interval_s == pytest.approx(8e-9, rel=1e-6)
+
+
+def test_timebase_too_many_samples_with_max_samples_zero_is_a_capture_error() -> None:
+    class _NoMemory(FakePs2000a):
+        def ps2000aGetTimebase2(self, *args: Any) -> tuple[int, float, int]:
+            super().ps2000aGetTimebase2(*args)
+            return (STATUS["PICO_TOO_MANY_SAMPLES"], 0.0, 0)
+
+    plug = PicoScope2000Plug(api=(fake := _NoMemory()))
+    with pytest.raises(CaptureError, match="maxSamples 0"):
+        plug.apply_capture(_single_channel())
+    assert len(_probes(fake)) == 1
 
 
 def test_too_many_samples_raises_capture_error_naming_both_numbers() -> None:
@@ -651,13 +921,50 @@ def test_wait_ready_timeout_stops_the_capture(clock: _Clock) -> None:
     plug.apply_capture(CAPTURE)
     plug.single()
     fake.log.clear()
-    with pytest.raises(TimeoutError, match="no trigger within 2 s"):
+    with pytest.raises(TimeoutError, match="capture not ready within 2.002 s"):
         plug.wait_ready(timeout_s=2.0, poll_s=0.5)
-    assert fake.log == [("ps2000aIsReady", (1,))] * 5 + [("ps2000aStop", (1,))]  # PG §3.65
-    assert clock.sleeps == [0.5] * 4
+    # deadline 2 s + 2 ms of capture time: polls at 0, 0.5, ... 2.5 s
+    assert fake.log == [("ps2000aIsReady", (1,))] * 6 + [("ps2000aStop", (1,))]  # PG §3.65
+    assert clock.sleeps == [0.5] * 5
     assert not fake.units[1].armed
     with pytest.raises(RuntimeError, match="single"):
         plug.read_waveform(1)
+
+
+def test_wait_ready_does_not_time_out_while_the_capture_itself_is_running(clock: _Clock) -> None:
+    # PG §3.37: timeIndisposedMs is the time the capture takes; it extends the deadline (S1)
+    plug, fake = _plug(ready_after=20)
+    plug.apply_capture(_single_channel(interval=0.33, pre=10, post=90))
+    plug.single()
+    assert plug.time_indisposed_ms == 33000
+    plug.wait_ready(timeout_s=10.0, poll_s=1.0)  # ready after 20 s on the fake clock
+    assert clock.now == 20.0
+    assert len(plug.read_waveform(1).raw) == 100
+
+
+def test_wait_ready_timeout_counts_the_capture_time_too(clock: _Clock) -> None:
+    plug, fake = _plug(ready_after=10**9)
+    plug.apply_capture(_single_channel(interval=0.33, pre=10, post=90))
+    plug.single()
+    fake.log.clear()
+    with pytest.raises(TimeoutError, match="capture not ready within 43 s"):
+        plug.wait_ready(timeout_s=10.0, poll_s=1.0)
+    assert clock.now == 43.0
+    assert _names(fake)[-1] == "ps2000aStop"
+
+
+def test_wait_ready_logs_the_polling_once(caplog: pytest.LogCaptureFixture) -> None:
+    plug, _ = _plug(ready_after=5)
+    plug.apply_capture(CAPTURE)
+    plug.single()
+    with caplog.at_level(logging.DEBUG):
+        plug.wait_ready()
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("ps2000aIsReady(" in m for m in messages)  # no record per poll
+    assert [m for m in messages if "ps2000aIsReady" in m] == [
+        "polling ps2000aIsReady (PG §3.26) for up to 10.002 s",
+        "ps2000aIsReady: ready after 6 poll(s)",
+    ]
 
 
 def test_wait_ready_timeout_survives_a_failing_stop() -> None:
@@ -720,6 +1027,28 @@ def test_read_waveform_before_single_raises() -> None:
     with pytest.raises(RuntimeError, match="single"):
         plug.read_waveform(1)
     assert "ps2000aGetValues" not in _names(fake)
+
+
+def test_read_waveform_after_stop_without_a_fetch_says_the_data_is_gone() -> None:
+    plug, fake = _plug()
+    _acquire(plug)
+    plug.stop()  # ready, but nothing fetched yet
+    with pytest.raises(RuntimeError, match=r"stopped before its data was read.*single\(\)"):
+        plug.read_waveform(1)
+    assert "ps2000aGetValues" not in _names(fake)
+    plug.single()  # a new capture makes the plug usable again
+    plug.wait_ready()
+    assert len(plug.read_waveform(1).raw) == 2000
+    plug.stop()
+    assert len(plug.read_waveform(2).raw) == 2000  # fetched: still readable after stop
+
+
+def test_stop_without_an_armed_capture_keeps_the_plain_message() -> None:
+    plug, _ = _plug()
+    plug.apply_capture(CAPTURE)
+    plug.stop()
+    with pytest.raises(RuntimeError, match="no capture armed; call single"):
+        plug.read_waveform(1)
 
 
 def test_read_waveform_before_ready_raises() -> None:
@@ -860,6 +1189,25 @@ def test_waveform_from_raw_round_trip() -> None:
     assert again.meta == w.meta
 
 
+def test_waveform_from_raw_requires_int16_counts() -> None:
+    meta = WaveformMeta(
+        channel=1,
+        range_v=1.0,
+        coupling="DC",
+        max_adc=32512,
+        sample_interval_s=1e-3,
+        pre_samples=0,
+        timebase=0,
+        overflow=False,
+        serial="S",
+        variant="V",
+    )
+    for bad in (np.zeros(4, dtype=np.int32), np.zeros(4), [1, 2, 3]):
+        with pytest.raises(ValueError, match="int16"):
+            waveform_from_raw(bad, meta)  # type: ignore[arg-type]
+    assert len(waveform_from_raw(np.zeros(4, dtype=np.int16), meta).v) == 4
+
+
 def test_waveform_from_raw_conversion_by_hand() -> None:
     meta = WaveformMeta(
         channel=1,
@@ -913,16 +1261,89 @@ def test_overflow_is_read_from_the_driver_bit_field() -> None:
     assert plug.read_waveform(2).meta.overflow is True
 
 
-def test_fewer_samples_than_requested_are_returned_as_is() -> None:
-    class _Short(FakePs2000a):
-        def ps2000aGetValues(self, *args: Any) -> tuple[int, int, int]:
-            status, n, overflow = super().ps2000aGetValues(*args)
-            return (status, n - 500, overflow)
-
-    plug = PicoScope2000Plug(api=_Short())
+def test_fewer_samples_than_requested_are_returned_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    plug, _ = _plug(short_read=1500)
     _acquire(plug)
-    w = plug.read_waveform(1)
+    with caplog.at_level(logging.WARNING):
+        w = plug.read_waveform(1)
+        plug.read_waveform(2)  # the fetch is shared: one warning only
     assert len(w.raw) == len(w.t) == len(w.v) == 1500
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+        "ps2000aGetValues returned 1500 of the 2000 requested samples"
+    ]
+
+
+def test_a_full_read_logs_no_warning(caplog: pytest.LogCaptureFixture) -> None:
+    plug, _ = _plug()
+    _acquire(plug)
+    with caplog.at_level(logging.WARNING):
+        plug.read_waveform(1)
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_unavailable_unit_info_comes_from_the_fake_knob(caplog: pytest.LogCaptureFixture) -> None:
+    fake = FakePs2000a(info_unavailable={"PICO_CAL_DATE", "PICO_FIRMWARE_VERSION_2"})
+    with caplog.at_level(logging.WARNING):
+        plug = PicoScope2000Plug(api=fake)
+    assert plug.info["PICO_CAL_DATE"] == "" and plug.info["PICO_FIRMWARE_VERSION_2"] == ""
+    assert plug.serial == "FAKE0/001" and plug.max_adc == 32512
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
+
+
+def test_unreachable_trigger_level_without_auto_trigger_times_out_and_stops(
+    clock: _Clock,
+) -> None:
+    plug, fake = _plug(clock_v=1.0)
+    capture = Capture(
+        channels=(Channel(ch=1, range=2 * V),),
+        sample_interval=1 * us,
+        pre_samples=100,
+        post_samples=900,
+        trigger=Edge(source=1, level=1.5 * V, auto_ms=0),  # the 1 V clock never gets there
+    )
+    plug.apply_capture(capture)
+    plug.single()
+    fake.log.clear()
+    with pytest.raises(TimeoutError, match="capture not ready within 3.001 s"):
+        plug.wait_ready(timeout_s=3.0, poll_s=0.5)
+    assert _names(fake)[-1] == "ps2000aStop"
+    assert not fake.units[1].armed
+    with pytest.raises(RuntimeError, match="stopped before its data was read"):
+        plug.read_waveform(1)
+
+
+def test_unreachable_trigger_level_with_auto_trigger_completes() -> None:
+    plug, _ = _plug(clock_v=1.0)
+    capture = Capture(
+        channels=(Channel(ch=1, range=2 * V),),
+        sample_interval=1 * us,
+        pre_samples=100,
+        post_samples=900,
+        trigger=Edge(source=1, level=1.5 * V, auto_ms=100),
+    )
+    _acquire(plug, capture)
+    w = plug.read_waveform(1)
+    assert len(w.raw) == 1000
+    assert measure.vpp(w) == pytest.approx(1.0, rel=1e-3)  # data arrived, at an arbitrary phase
+    assert w.raw[100] > 0  # phase 0.37 (SPEC §6), not the edge-aligned phase 0 of a real trigger
+    assert w.raw[99] > 0
+
+
+def test_channel_identity_is_kept_with_different_channel_amplitudes() -> None:
+    # B carries 0.5 V, A 1 V: a swap of the two buffers would show here
+    plug, _ = _plug(clock_v=1.0, per_channel_scale={B: 0.5})
+    _acquire(plug)
+    a, b = plug.read_waveform(1), plug.read_waveform(2)
+    assert measure.vpp(a) == pytest.approx(1.0, rel=1e-3)
+    assert measure.vpp(b) == pytest.approx(0.5, rel=1e-3)
+    assert a.meta.channel == 1 and b.meta.channel == 2
+    # also after a capture that registered B's buffer first with a different size
+    plug.apply_capture(_single_channel(pre=10, post=90))
+    plug.apply_capture(CAPTURE)
+    _acquire(plug)
+    assert measure.vpp(plug.read_waveform(2)) == pytest.approx(0.5, rel=1e-3)
 
 
 # -- teardown and the closed plug -------------------------------------------------------------
