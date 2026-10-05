@@ -82,8 +82,10 @@ Process and robustness conventions: the siglent siblings (`docs/research.md`).
 
 ```
 src/picoscope_2000_openhtf/
-  __init__.py        exports PicoScope2000Plug, Waveform, WaveformMeta, Capture, Channel, Edge,
-                     PicoError, CaptureError, ClippedError, __version__
+  __init__.py        exports PicoScope2000Plug, Waveform, WaveformMeta, waveform_from_raw, Capture,
+                     Channel, Edge, PicoError, CaptureError, ClippedError, __version__; the plug-side
+                     names are resolved lazily (PEP 562 __getattr__) so that importing
+                     fake_resource through the package loads neither openhtf nor picosdk
   units.py           V, mV, s, ms, us, ns constants (floats), nothing else
   capture.py         Capture, Channel, Edge dataclasses; RANGES table; validation
   driver.py          Ps2000aApi Protocol (the seam) and PicosdkApi (the real adapter)
