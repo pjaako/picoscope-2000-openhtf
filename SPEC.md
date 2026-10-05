@@ -67,6 +67,14 @@ Process and robustness conventions: the siglent siblings (`docs/research.md`).
   manual lists per function which codes it returns. `picosdk.constants`
   mirrors that header (`PICO_STATUS`, `PICO_STATUS_LOOKUP`) and imports
   without the native library.
+- Numeric values of enums (`PS2000A_*`) and status codes (`PICO_*`) are
+  **not in the manual** (§4.1, §4.2 point to `PicoStatus.h` and
+  `ps2000aApi.h`). The only mirror in this repository is `picosdk`
+  (`picosdk.constants.PICO_STATUS`, `PICO_INFO`, and the enum dicts on the
+  `ps2000a` library object, listed in `docs/api_reference.md`). Code uses
+  names only and resolves them through picosdk at call time. Three manual
+  sections spell the invalid-handle code `PICO_HANDLE_INVALID`; the header
+  has only `PICO_INVALID_HANDLE`, which is what code and fake use.
 - Analog offset (`analogOffset`, §3.39), MSO digital ports, rapid block,
   streaming, ETS, signal generator and advanced triggers are out of phase 1.
 
