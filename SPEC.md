@@ -145,7 +145,9 @@ the reference wins and you report it.
   normalise to the key).
 - `Edge(source: int, level: float, direction: Literal[...] = "RISING",
   auto_ms: int = 0, delay_samples: int = 0)`. `level` is volts; `auto_ms`
-  0..32767 (int16 per §3.56), `delay_samples >= 0`.
+  0..32767 (int16 per §3.56), `delay_samples == 0` in phase 1 (a non-zero
+  delay moves the trigger instant off index `pre_samples`, §3.56; rejected
+  with `ValueError` until open question 30 is settled).
 - `Capture(channels: tuple[Channel, ...], sample_interval: float,
   pre_samples: int, post_samples: int, trigger: Edge | None = None)`.
   Rules: 1..4 channels with distinct `ch`; `sample_interval > 0`;
@@ -289,7 +291,11 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]
   `"PICO_NOT_FOUND"`-equivalent message (use the manual's handle semantics in
   the text). Then `ps2000aGetUnitInfo` for the eleven info codes into
   `self.info: dict[str, str]` (code name → string; an info that returns
-  `PICO_INFO_UNAVAILABLE` is stored as `""`, other errors raise), then
+  `PICO_INFO_UNAVAILABLE` or `PICO_INVALID_INFO` is stored as `""` with a
+  WARNING, other errors raise). An `EnumerateUnits` failure is a WARNING,
+  not an error (enumeration is informational). A non-`PICO_OK` from
+  `OpenUnit` that still returns `handle > 0` closes that handle before
+  raising., then
   `ps2000aMaximumValue`/`ps2000aMinimumValue` into `self.max_adc`,
   `self.min_adc`. Properties `serial` (from `PICO_BATCH_AND_SERIAL`) and
   `variant` (from `PICO_VARIANT_INFO`). If anything after `OpenUnit` fails,
@@ -301,25 +307,31 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]
      range, 0.0)`; disabled channels are sent with `enabled=0`,
      `"PS2000A_DC"`, `"PS2000A_1V"`, `0.0` (the manual gives no "don't care"
      values; `# ASSUMPTION(hw): any valid coupling/range is accepted for a
-     disabled channel`). A `PICO_INVALID_CHANNEL` status for a **disabled**
-     channel 3 or 4 is tolerated (logged at INFO) and means the unit has
-     two channels: record `self.channel_count` (4 by default, 2 then). Any
-     other non-`PICO_OK`, and any failure for an enabled channel, raises
-     `PicoError`. (`# ASSUMPTION(hw)`, open question 21.)
+     disabled channel`). Any non-`PICO_OK` status for a **disabled**
+     channel 3 or 4 is tolerated (logged at INFO with the status name) and
+     means the unit has two channels: record `self.channel_count` (4 by
+     default, 2 then) and skip channels 3 and 4 in later `apply_capture`
+     calls. A failure for an enabled channel raises `PicoError`.
+     (`# ASSUMPTION(hw)`, open question 21.)
   2. Timebase search: estimate `n` from the 1 GS/s table of §2.7
-     (`# ASSUMPTION(hw): 2207B MSO is a 1 GS/s model; the search below makes
-     the result correct either way`): `n = 0,1,2` for 1, 2, 4 ns; else
-     `n = round(interval_s * 125e6) + 2`. Call `ps2000aGetTimebase2(handle, n,
-     total, 0, 0)`; if the returned interval (ns, converted to s) is below the
-     requested one, increment `n`; if `n > 0` and the interval for `n - 1`
-     would still be `>=` the requested one (query it), decrement. Accept the
-     smallest `n` whose interval `>=` requested; cap the search at 64 calls,
-     then raise `CaptureError`. A `PICO_INVALID_TIMEBASE` (or any
-     non-`PICO_OK`) at the estimate means `n` is too small for the enabled
-     channel count (e.g. `n = 0` with two channels, §2.7 footnote): increment
-     and continue; any other status after that raises `PicoError`. The
-     driver returns the interval as a C `float` (§3.14), so compare with
-     `math.isclose(rel_tol=1e-6)` before `<`/`>=`.
+     (`# ASSUMPTION(hw): the 2207B MSO is a 1 GS/s model; the re-estimate
+     below makes the result correct for a 500 MS/s model too`): `n = 0, 1,
+     2` for 1, 2, 4 ns; else `n = round(interval_s * 125e6) + 2`. Call
+     `ps2000aGetTimebase2(handle, n, total, 0, 0)`. A non-`PICO_OK` at this
+     first probe (e.g. `PICO_INVALID_TIMEBASE` because `n = 0` needs
+     single-channel mode, §2.7 footnote) is tolerated: increment `n` and
+     probe again, up to `n = 3`. `PICO_TOO_MANY_SAMPLES` counts as a valid
+     probe whose outputs are used (open question 26; with `maxSamples == 0`
+     raise `CaptureError`). Once a valid probe `(n0, I0)` exists with
+     `n0 >= 3`, re-estimate `n1 = 2 + ceil((n0 - 2) * requested / I0 -
+     1e-9)` (the interval is linear in `n - 2` for `n >= 3` in both tables),
+     probe `n1`, then refine by ±1 until `n` is the smallest index whose
+     interval is `>=` the requested one. The driver returns a C `float`
+     (§3.14): accept `interval >= requested` with `math.isclose(rel_tol=1e-6)`
+     only when stepping *up* to accept, never to justify stepping down. At
+     most 8 probes after the first valid one; beyond that raise
+     `CaptureError`. Any other non-`PICO_OK` after the first valid probe
+     raises `PicoError`.
   3. If `total > maxSamples` raise `CaptureError` naming both numbers.
   4. Trigger: with `Edge`, `ps2000aSetSimpleTrigger(handle, 1, source name,
      capture.trigger_threshold_adc(self.max_adc), direction name,
@@ -328,6 +340,11 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]
      (`# ASSUMPTION(hw): disabling with enable=0 ignores the other arguments`).
   5. Buffers: one `np.zeros(total, dtype=np.int16)` per enabled channel,
      `ps2000aSetDataBuffer(handle, name, buf, 0, "PS2000A_RATIO_MODE_NONE")`.
+     **Lifetime rule:** the driver keeps the raw pointer (§3.40), so every
+     array ever registered stays referenced in `self._registered[ch]` for
+     the life of the plug; an entry is only overwritten right after its own
+     successful `SetDataBuffer`, never dropped on a channel change or a
+     partial failure. `read_waveform` reads from `_registered`.
   6. Remember the resolved state: `self.capture`, `self.timebase`,
      `self.sample_interval_s` (from the driver, not the request),
      `self.max_samples`, buffers. Invalidate any cached waveforms.
@@ -340,14 +357,18 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]
 - `wait_ready(timeout_s: float | None = None, poll_s: float = 0.01) -> None`:
   the rigol plug calls this `wait_stopped`; the manual's word is *ready*
   (§3.26). Poll `ps2000aIsReady` until `ready != 0`; `time.monotonic()`
-  deadline from `timeout_s` or the plug's timeout; on expiry call
-  `ps2000aStop` and raise `TimeoutError("no trigger within X s")`. Keep
+  deadline = now + (`timeout_s` or the plug's timeout) +
+  `time_indisposed_ms / 1000` (§3.37: the capture itself takes that long,
+  excluding the auto-trigger wait); on expiry call `ps2000aStop` and raise
+  `TimeoutError("capture not ready within X s")`. Log the polling once
+  (start and poll count), not per poll. Keep
   `time.sleep` and `time.monotonic` as module attributes so tests can
   monkeypatch them; tests never sleep for real.
 - `read_waveform(ch: int) -> Waveform`: requires an armed-and-ready state
   (`RuntimeError` otherwise). On the first call after `single()`, one
   `ps2000aGetValues(handle, 0, total, 1, "PS2000A_RATIO_MODE_NONE", 0)` fills
-  all buffers (§3.18); store `noOfSamples` returned and `overflow`. Return
+  all buffers (§3.18); store `noOfSamples` returned and `overflow`; WARN when fewer samples
+  than requested came back. Return
   `waveform_from_raw(raw=buffer[:n].copy(), meta=...)` where
   `overflow` for this channel is `bool(overflow >> (ch - 1) & 1)`
   (§3.18: bit 0 = channel A). Further calls for other channels reuse the
@@ -404,7 +425,10 @@ recompute `t` and `v`.
   the rigol-dho algorithm: levels at the 5th/95th percentile of `v`, rising
   crossings detected with hysteresis (below `lo + low*(hi-lo)`, then above
   `lo + high*(hi-lo)`), frequency = (crossings - 1) / (time between first and
-  last crossing); fewer than two crossings → `ValueError("not periodic")`.
+  last crossing); fewer than two crossings → `ValueError("not periodic")`; an
+  amplitude `hi - lo` below `min_vpp` (keyword, default 4 ADC codes, i.e.
+  `4 * range_v / max_adc`) → `ValueError("not periodic")` too, so a flat
+  trace with ADC noise (a disconnected probe) is not reported as a frequency.
 - `period_s`, the inverse. Each function raises `ClippedError` when
   `is_clipped(w)` unless `allow_clipped=True`.
 
@@ -487,7 +511,21 @@ no `picosdk`, `openhtf` or `picoscope_2000_openhtf` module is loaded, and an
   - `Stop`: clears the armed state, keeps the data (§2.6.1 "Data retention").
   - `CloseUnit`: forgets the handle, the serial becomes unopened again.
   - `FlashLed`, `PingUnit`: logged, `PICO_OK`.
-  - Every method first appends to `log`, then checks `reject`.
+  - Every method first appends to `log`, then checks `reject`. `log`
+    stores buffer arguments as `("ndarray", id, len)`, not the array.
+  - Strictness (lessons from review R1): `unit.buffers` holds **weak
+    references** to registered arrays; `GetValues` returns
+    `PICO_INVALID_PARAMETER` when a referenced array has been garbage
+    collected (models the driver's dangling pointer). The trigger **level**
+    is honoured: if the level is outside the generated signal's span and
+    `auto_ms == 0`, `IsReady` never becomes ready; with `auto_ms > 0` the
+    phase is arbitrary (deterministic 0.37). `ready_after` is the default;
+    constructor knobs `short_read: int | None` (GetValues returns that many
+    samples) and `info_unavailable: set[str]` (those info codes return
+    `PICO_INFO_UNAVAILABLE`) make the data path fail on demand. Optional
+    `adc_bits: int = 16` quantises codes to multiples of `2**(16-adc_bits)`;
+    optional `per_channel_scale: Mapping[str, float]` multiplies the clock
+    amplitude per channel so A/B buffer swaps are detectable.
 
 ## 7. Tests (`tests/`, pytest, no hardware, no sleeps, no network)
 
