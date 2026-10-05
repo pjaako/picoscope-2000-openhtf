@@ -299,7 +299,11 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]
      range, 0.0)`; disabled channels are sent with `enabled=0`,
      `"PS2000A_DC"`, `"PS2000A_1V"`, `0.0` (the manual gives no "don't care"
      values; `# ASSUMPTION(hw): any valid coupling/range is accepted for a
-     disabled channel`).
+     disabled channel`). A `PICO_INVALID_CHANNEL` status for a **disabled**
+     channel 3 or 4 is tolerated (logged at INFO) and means the unit has
+     two channels: record `self.channel_count` (4 by default, 2 then). Any
+     other non-`PICO_OK`, and any failure for an enabled channel, raises
+     `PicoError`. (`# ASSUMPTION(hw)`, open question 21.)
   2. Timebase search: estimate `n` from the 1 GS/s table of §2.7
      (`# ASSUMPTION(hw): 2207B MSO is a 1 GS/s model; the search below makes
      the result correct either way`): `n = 0,1,2` for 1, 2, 4 ns; else
@@ -311,7 +315,9 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]
      then raise `CaptureError`. A `PICO_INVALID_TIMEBASE` (or any
      non-`PICO_OK`) at the estimate means `n` is too small for the enabled
      channel count (e.g. `n = 0` with two channels, §2.7 footnote): increment
-     and continue; any other status after that raises `PicoError`.
+     and continue; any other status after that raises `PicoError`. The
+     driver returns the interval as a C `float` (§3.14), so compare with
+     `math.isclose(rel_tol=1e-6)` before `<`/`>=`.
   3. If `total > maxSamples` raise `CaptureError` naming both numbers.
   4. Trigger: with `Edge`, `ps2000aSetSimpleTrigger(handle, 1, source name,
      capture.trigger_threshold_adc(self.max_adc), direction name,
