@@ -7,6 +7,7 @@ name = "picoscope-2000-openhtf"
 version = "0.1.0"
 description = "OpenHTF plug for PicoScope 2000 Series (A API) USB oscilloscopes"
 license = "MIT"
+readme = "README.md"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = [
@@ -36,7 +37,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
 strict = true
-files = ["src", "tests", "tools"]
+files = ["src", "tests", "tools", "example_test.py"]
 
 [[tool.mypy.overrides]]
 module = ["openhtf", "openhtf.*", "picosdk", "picosdk.*"]

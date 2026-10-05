@@ -9,6 +9,7 @@ Status for a cold agent. Keep this current at every commit.
 - 2026-10-05 `AGENTS.md`, `SPEC.md` (phase 1 contract).
 - 2026-10-05 D1 `docs/api_reference.md` (manual transcription, 84 flagged notes, 20 open hardware questions); T1 units/capture/measure (531563b).
 - 2026-10-05 T2 driver seam + picosdk adapter (d1c9074); T3 fake driver (b4e4b20); open questions 21..29 added.
+- 2026-10-05 T4 plug + tests (d5a7d49); T5 example_test.py, tools/probe.py, README (this commit). 441 tests, example passes in fake mode.
 
 ## Task board
 | id | task | owner | state |
@@ -18,13 +19,13 @@ Status for a cold agent. Keep this current at every commit.
 | T1 | `units.py`, `capture.py`, `measure.py` + tests | coder | done |
 | T2 | `driver.py` (Protocol + PicosdkApi) + `tests/test_driver.py` | coder | done |
 | T3 | `fake_resource.py` + `tests/test_fake_resource.py` | coder | done |
-| T4 | `plug.py` + `tests/test_plug.py` (incl. htf integration) | coder | in flight |
-| T5 | `example_test.py`, `tools/probe.py`, `tests/test_examples.py`, README | coder | waiting on T4 |
-| R1 | review of T1..T5 against SPEC and manual by a stronger agent | reviewer | waiting on T5 |
+| T4 | `plug.py` + `tests/test_plug.py` (incl. htf integration) | coder | done |
+| T5 | `example_test.py`, `tools/probe.py`, `tests/test_examples.py`, README | coder | done |
+| R1 | review of T1..T5 against SPEC and manual by a stronger agent | reviewer | in flight |
 | STOP | hardware session 1 on the user's Linux machine (owner + user) | human gate | blocked |
 
 ## In flight
-- T4 (see board). Owner integrates each result, runs the four checks, commits with the task id.
+- R1 review (see board); fix-up round follows, then the hardware handoff note. Owner integrates each result, runs the four checks, commits with the task id.
 
 ## Blocked on hardware
 - All `# ASSUMPTION(hw)` items and `docs/api_reference.md` "Open questions". The cloud session cannot reach picotech.com (proxy 403) and has no native driver; hardware session 1 runs on the user's local Linux x86 machine with `tools/probe.py`, `PICOSCOPE_SERIAL` set.
