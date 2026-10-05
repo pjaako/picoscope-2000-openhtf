@@ -102,15 +102,27 @@ found (one pass, `"; "`-joined), never only the first.
 
 ```python
 RANGES: Mapping[float, str] = {  # PG §3.39, full-scale volts -> enum name
-    20 * mV: "PS2000A_20MV", 50 * mV: "PS2000A_50MV", 100 * mV: "PS2000A_100MV",
-    200 * mV: "PS2000A_200MV", 500 * mV: "PS2000A_500MV", 1 * V: "PS2000A_1V",
-    2 * V: "PS2000A_2V", 5 * V: "PS2000A_5V", 10 * V: "PS2000A_10V", 20 * V: "PS2000A_20V",
+    20 * mV: "PS2000A_20MV",
+    50 * mV: "PS2000A_50MV",
+    100 * mV: "PS2000A_100MV",
+    200 * mV: "PS2000A_200MV",
+    500 * mV: "PS2000A_500MV",
+    1 * V: "PS2000A_1V",
+    2 * V: "PS2000A_2V",
+    5 * V: "PS2000A_5V",
+    10 * V: "PS2000A_10V",
+    20 * V: "PS2000A_20V",
 }
-CHANNEL_NAMES: Mapping[int, str] = {1: "PS2000A_CHANNEL_A", 2: "PS2000A_CHANNEL_B",
-                                    3: "PS2000A_CHANNEL_C", 4: "PS2000A_CHANNEL_D"}  # PG §3.39
+CHANNEL_NAMES: Mapping[int, str] = {
+    1: "PS2000A_CHANNEL_A",
+    2: "PS2000A_CHANNEL_B",
+    3: "PS2000A_CHANNEL_C",
+    4: "PS2000A_CHANNEL_D",
+}  # PG §3.39
 COUPLINGS: Mapping[str, str] = {"AC": "PS2000A_AC", "DC": "PS2000A_DC"}  # PG §3.39
-DIRECTIONS: Mapping[str, str] = {d: f"PS2000A_{d}" for d in
-                                 ("ABOVE", "BELOW", "RISING", "FALLING", "RISING_OR_FALLING")}  # PG §3.56
+DIRECTIONS: Mapping[str, str] = {
+    d: f"PS2000A_{d}" for d in ("ABOVE", "BELOW", "RISING", "FALLING", "RISING_OR_FALLING")
+}  # PG §3.56
 ```
 
 Confirm the enum member names against `docs/api_reference.md` (the
@@ -151,28 +163,57 @@ fake validates them against its own tables.
 
 ```python
 class Ps2000aApi(Protocol):
-    def ps2000aEnumerateUnits(self) -> tuple[int, int, str]: ...            # status, count, serials  PG §3.4
-    def ps2000aOpenUnit(self, serial: str | None) -> tuple[int, int]: ...   # status, handle          PG §3.32
-    def ps2000aCloseUnit(self, handle: int) -> tuple[int]: ...              # PG §3.2
-    def ps2000aGetUnitInfo(self, handle: int, info: str) -> tuple[int, str]: ...  # info = "PICO_VARIANT_INFO" etc.  PG §3.17
-    def ps2000aPingUnit(self, handle: int) -> tuple[int]: ...               # PG §3.35
-    def ps2000aFlashLed(self, handle: int, start: int) -> tuple[int]: ...   # PG §3.5
-    def ps2000aMaximumValue(self, handle: int) -> tuple[int, int]: ...      # PG §3.28
-    def ps2000aMinimumValue(self, handle: int) -> tuple[int, int]: ...      # PG §3.30
-    def ps2000aSetChannel(self, handle: int, channel: str, enabled: int, type: str,
-                          range: str, analogOffset: float) -> tuple[int]: ...   # PG §3.39
-    def ps2000aGetTimebase2(self, handle: int, timebase: int, noSamples: int, oversample: int,
-                            segmentIndex: int) -> tuple[int, float, int]: ...  # status, timeIntervalNanoseconds, maxSamples  PG §3.14
-    def ps2000aSetSimpleTrigger(self, handle: int, enable: int, source: str, threshold: int,
-                                direction: str, delay: int, autoTrigger_ms: int) -> tuple[int]: ...  # PG §3.56
-    def ps2000aSetDataBuffer(self, handle: int, channel: str, buffer: npt.NDArray[np.int16],
-                             segmentIndex: int, mode: str) -> tuple[int]: ...  # bufferLth = len(buffer)  PG §3.40
-    def ps2000aRunBlock(self, handle: int, noOfPreTriggerSamples: int, noOfPostTriggerSamples: int,
-                        timebase: int, oversample: int, segmentIndex: int) -> tuple[int, int]: ...  # status, timeIndisposedMs; lpReady/pParameter always NULL  PG §3.37
-    def ps2000aIsReady(self, handle: int) -> tuple[int, int]: ...           # status, ready  PG §3.26
-    def ps2000aGetValues(self, handle: int, startIndex: int, noOfSamples: int, downSampleRatio: int,
-                         downSampleRatioMode: str, segmentIndex: int) -> tuple[int, int, int]: ...  # status, noOfSamples out, overflow  PG §3.18
-    def ps2000aStop(self, handle: int) -> tuple[int]: ...                   # PG §3.65
+    def ps2000aEnumerateUnits(self) -> tuple[int, int, str]: ...  # status, count, serials  PG §3.4
+    def ps2000aOpenUnit(
+        self, serial: str | None
+    ) -> tuple[int, int]: ...  # status, handle          PG §3.32
+    def ps2000aCloseUnit(self, handle: int) -> tuple[int]: ...  # PG §3.2
+    def ps2000aGetUnitInfo(
+        self, handle: int, info: str
+    ) -> tuple[int, str]: ...  # info = "PICO_VARIANT_INFO" etc.  PG §3.17
+    def ps2000aPingUnit(self, handle: int) -> tuple[int]: ...  # PG §3.35
+    def ps2000aFlashLed(self, handle: int, start: int) -> tuple[int]: ...  # PG §3.5
+    def ps2000aMaximumValue(self, handle: int) -> tuple[int, int]: ...  # PG §3.28
+    def ps2000aMinimumValue(self, handle: int) -> tuple[int, int]: ...  # PG §3.30
+    def ps2000aSetChannel(
+        self, handle: int, channel: str, enabled: int, type: str, range: str, analogOffset: float
+    ) -> tuple[int]: ...  # PG §3.39
+    def ps2000aGetTimebase2(
+        self, handle: int, timebase: int, noSamples: int, oversample: int, segmentIndex: int
+    ) -> tuple[int, float, int]: ...  # status, timeIntervalNanoseconds, maxSamples  PG §3.14
+    def ps2000aSetSimpleTrigger(
+        self,
+        handle: int,
+        enable: int,
+        source: str,
+        threshold: int,
+        direction: str,
+        delay: int,
+        autoTrigger_ms: int,
+    ) -> tuple[int]: ...  # PG §3.56
+    def ps2000aSetDataBuffer(
+        self, handle: int, channel: str, buffer: npt.NDArray[np.int16], segmentIndex: int, mode: str
+    ) -> tuple[int]: ...  # bufferLth = len(buffer)  PG §3.40
+    def ps2000aRunBlock(
+        self,
+        handle: int,
+        noOfPreTriggerSamples: int,
+        noOfPostTriggerSamples: int,
+        timebase: int,
+        oversample: int,
+        segmentIndex: int,
+    ) -> tuple[int, int]: ...  # status, timeIndisposedMs; lpReady/pParameter always NULL  PG §3.37
+    def ps2000aIsReady(self, handle: int) -> tuple[int, int]: ...  # status, ready  PG §3.26
+    def ps2000aGetValues(
+        self,
+        handle: int,
+        startIndex: int,
+        noOfSamples: int,
+        downSampleRatio: int,
+        downSampleRatioMode: str,
+        segmentIndex: int,
+    ) -> tuple[int, int, int]: ...  # status, noOfSamples out, overflow  PG §3.18
+    def ps2000aStop(self, handle: int) -> tuple[int]: ...  # PG §3.65
 ```
 
 Check each signature against `docs/api_reference.md` before coding; if the
@@ -218,8 +259,14 @@ manual and report the difference.
 ```python
 class PicoScope2000Plug(BasePlug):  # type: ignore[misc]
     auto_placeholder = True
-    def __init__(self, serial: str | None = None, *, api: Ps2000aApi | None = None,
-                 timeout_s: float | None = None) -> None: ...
+
+    def __init__(
+        self,
+        serial: str | None = None,
+        *,
+        api: Ps2000aApi | None = None,
+        timeout_s: float | None = None,
+    ) -> None: ...
 ```
 
 - CONF keys, declared at import: `picoscope_2000_serial` (default `None`),
@@ -302,19 +349,28 @@ class PicoScope2000Plug(BasePlug):  # type: ignore[misc]
 
 ```python
 class WaveformMeta(NamedTuple):
-    channel: int; range_v: float; coupling: str; max_adc: int
-    sample_interval_s: float; pre_samples: int; timebase: int
-    overflow: bool; serial: str; variant: str
+    channel: int
+    range_v: float
+    coupling: str
+    max_adc: int
+    sample_interval_s: float
+    pre_samples: int
+    timebase: int
+    overflow: bool
+    serial: str
+    variant: str
+
 
 class Waveform(NamedTuple):
-    t: npt.NDArray[np.float64]   # seconds, t == 0 at the first post-trigger sample
-    v: npt.NDArray[np.float64]   # volts
-    raw: npt.NDArray[np.int16]   # untouched ADC counts
+    t: npt.NDArray[np.float64]  # seconds, t == 0 at the first post-trigger sample
+    v: npt.NDArray[np.float64]  # volts
+    raw: npt.NDArray[np.int16]  # untouched ADC counts
     meta: WaveformMeta
+
 
 def waveform_from_raw(raw, meta) -> Waveform:
     t = (np.arange(len(raw)) - meta.pre_samples) * meta.sample_interval_s
-    v = raw.astype(np.float64) * (meta.range_v / meta.max_adc)   # PG §2.3
+    v = raw.astype(np.float64) * (meta.range_v / meta.max_adc)  # PG §2.3
 ```
 
 `# ASSUMPTION(hw): the trigger point is sample index pre_samples` (§3.37
